@@ -1,0 +1,270 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Library">
+      <UniqueIdentifier>{c8b71a94-dbf6-5818-830e-078d12d91df0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Library\ImGui">
+      <UniqueIdentifier>{c2b9e87e-22b7-5860-bf33-14925195bb7b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Library\Lua">
+      <UniqueIdentifier>{79a9f938-52b3-57dd-b61c-eb0f0a6a966c}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source">
+      <UniqueIdentifier>{e25fdf9a-e54e-5571-a8f0-d1ecf6236d1e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source\Bot">
+      <UniqueIdentifier>{ff682794-19af-58de-99cd-357e75d3f625}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source\Core">
+      <UniqueIdentifier>{73a25774-4378-5584-acee-7de4ae2daa51}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source\Game">
+      <UniqueIdentifier>{5f855e46-11f0-5284-82b7-f57dd1ed2910}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source\Main">
+      <UniqueIdentifier>{06baed1a-6e5c-52a2-ba46-fcaf832cae75}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source\Net">
+      <UniqueIdentifier>{7c05c488-3d57-5039-af8e-ae2da96db16d}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source\Script">
+      <UniqueIdentifier>{ae60ea56-719c-5279-8d32-fe02314beb87}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source\UI">
+      <UniqueIdentifier>{041fb265-57a2-5ec0-b136-25b380a66ebc}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Source\Bot\Bot.cpp">
+      <Filter>Source\Bot</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Bot\BotManager.cpp">
+      <Filter>Source\Bot</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Bot\Events.cpp">
+      <Filter>Source\Bot</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Core\Crypto.cpp">
+      <Filter>Source\Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Core\Json.cpp">
+      <Filter>Source\Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Core\Log.cpp">
+      <Filter>Source\Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Core\Text.cpp">
+      <Filter>Source\Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Game\Login.cpp">
+      <Filter>Source\Game</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Game\Protocol.cpp">
+      <Filter>Source\Game</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Main\Bench.cpp">
+      <Filter>Source\Main</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Main\Config.cpp">
+      <Filter>Source\Main</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Main\Main.cpp">
+      <Filter>Source\Main</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Net\Https.cpp">
+      <Filter>Source\Net</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Net\Socket.cpp">
+      <Filter>Source\Net</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Net\Socks5Udp.cpp">
+      <Filter>Source\Net</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Net\Tls.cpp">
+      <Filter>Source\Net</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Script\LuaApi.cpp">
+      <Filter>Source\Script</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Script\ScriptEngine.cpp">
+      <Filter>Source\Script</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\UI\App.cpp">
+      <Filter>Source\UI</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lapi.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lauxlib.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lbaselib.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lcode.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lcorolib.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lctype.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\ldblib.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\ldebug.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\ldo.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\ldump.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lfunc.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lgc.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\linit.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\liolib.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\llex.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lmathlib.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lmem.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\loadlib.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lobject.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lopcodes.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\loslib.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lparser.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lstate.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lstring.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lstrlib.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\ltable.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\ltablib.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\ltm.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lundump.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lutf8lib.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lvm.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\Lua\lzio.c">
+      <Filter>Library\Lua</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\ImGui\imgui.cpp">
+      <Filter>Library\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\ImGui\imgui_draw.cpp">
+      <Filter>Library\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\ImGui\imgui_tables.cpp">
+      <Filter>Library\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\ImGui\imgui_widgets.cpp">
+      <Filter>Library\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\ImGui\imgui_impl_win32.cpp">
+      <Filter>Library\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\ImGui\imgui_impl_dx11.cpp">
+      <Filter>Library\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="Library\ImGui\imgui_stdlib.cpp">
+      <Filter>Library\ImGui</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Source\Bot\Bot.hpp">
+      <Filter>Source\Bot</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Bot\BotManager.hpp">
+      <Filter>Source\Bot</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Bot\Events.hpp">
+      <Filter>Source\Bot</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Core\Crypto.hpp">
+      <Filter>Source\Core</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Core\Json.hpp">
+      <Filter>Source\Core</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Core\Log.hpp">
+      <Filter>Source\Core</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Core\Text.hpp">
+      <Filter>Source\Core</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Game\Login.hpp">
+      <Filter>Source\Game</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Game\Protocol.hpp">
+      <Filter>Source\Game</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Main\Bench.hpp">
+      <Filter>Source\Main</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Main\Config.hpp">
+      <Filter>Source\Main</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Net\Https.hpp">
+      <Filter>Source\Net</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Net\Socket.hpp">
+      <Filter>Source\Net</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Net\Socks5Udp.hpp">
+      <Filter>Source\Net</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Net\Tls.hpp">
+      <Filter>Source\Net</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Script\ScriptEngine.hpp">
+      <Filter>Source\Script</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Script\ScriptRuntime.hpp">
+      <Filter>Source\Script</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\UI\App.hpp">
+      <Filter>Source\UI</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>
