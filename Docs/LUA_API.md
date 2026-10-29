@@ -1,381 +1,383 @@
 # GrowtopiaBot Lua API
 
-GrowtopiaBot, botları **Lua 5.4** scriptleriyle yönetmeni sağlar: bağlanma / kopma, warp, konuşma,
-drop, yürüme, punch/place, ham paket gönderme ve botun tüm bilgilerini (isim, envanter, world,
-oyuncular, gems, ping...) okuma. Oyun içi olaylara (`console`, `talk`, `world_enter`,
-`disconnected`...) handler bağlayabilirsin.
+GrowtopiaBot lets you control the bots with **Lua 5.4** scripts: connect / disconnect, warp, chat,
+drop, walk (pathfinding), punch/place, collect dropped items, send raw packets and read everything
+about a bot (name, inventory, world, tiles, players, gems, ping...). You can attach handlers to
+in-game events (`console`, `talk`, `world_enter`, `disconnected`...).
 
-- Scriptler `GrowtopiaBot.exe` yanındaki **`scripts/`** klasöründe durur (`.lua`).
-- Paneldeki **Scripts** sekmesinden yazılır, kaydedilir (Ctrl+S), yüklenir ve çalıştırılır (F5).
-- Aynı sekmenin altındaki **Lua >** satırı tek satırlık komut çalıştırır: `getBot().gems`
-  yazarsan sonucu basar.
-- Örnekler: `Docs/examples/` (build sırasında `scripts/` içine kopyalanır).
-
----
-
-## İçindekiler
-
-1. [Nasıl çalışır](#1-nasıl-çalışır)
-2. [Global fonksiyonlar](#2-global-fonksiyonlar)
-3. [Bot nesnesi — özellikler](#3-bot-nesnesi--özellikler)
-4. [Bot nesnesi — metotlar](#4-bot-nesnesi--metotlar)
-5. [Olaylar (events)](#5-olaylar-events)
-6. [Durum (status) değerleri](#6-durum-status-değerleri)
-7. [Örnekler](#7-örnekler)
-8. [Performans notları ve sınırlar](#8-performans-notları-ve-sınırlar)
+- Scripts live in the **`scripts/`** folder next to `GrowtopiaBot.exe` (`.lua`).
+- Write, save (Ctrl+S), load and run (F5) them from the **Scripts** tab of the panel.
+- The **Lua >** line at the bottom of the same tab runs one line at a time: type `getBot().gems`
+  and it prints the result.
+- Examples: `Docs/examples/` (copied into `scripts/` during the build).
 
 ---
 
-## 1. Nasıl çalışır
+## Contents
 
-- Her script **kendi thread'inde ve kendi Lua state'inde** çalışır. Bir scriptin sonsuz
-  döngüsü ne botları ne paneli yavaşlatır; aynı anda istediğin kadar script çalışabilir.
-- Bot komutları (`warp`, `say`, `drop`...) **sıraya alınır** ve botun kendi thread'inde
-  çalışır; fonksiyon hemen döner. Sonucunu beklemek için `waitFor...` fonksiyonlarını
-  ya da `wait()`'i kullan.
-- Okumalar (`bot.world`, `bot.gems`...) her zaman **o anki** değeri verir (kilitli, thread-safe).
-- **Olay handler'ları** (`on(...)`) sadece script `sleep()`, `wait()`, `listen()` veya bir
-  `waitFor...` içindeyken çalışır. Yani handler'lar ana kodunla aynı anda koşmaz — kilit,
-  race condition derdi yok.
-- Script durdurulduğunda (panelde **Stop** veya `stopScript(id)`) çalışan kod nerede olursa olsun
-  (sonsuz döngü, `sleep`, `pcall` içi dahil) birkaç milisaniye içinde kesilir.
-- `getBot()` argümansız çağrılınca, **panelde seçili olan** botu döndürür (yoksa listedeki ilk bot).
-  "Run for every bot" butonu scripti her bot için ayrı ayrı başlatır; her kopyada
-  `getBot()` o botu verir.
-
-Hata olursa script durur, hata satır numarasıyla birlikte **Output** paneline ve loga yazılır.
+1. [How it works](#1-how-it-works)
+2. [Global functions](#2-global-functions)
+3. [Bot object — properties](#3-bot-object--properties)
+4. [Bot object — methods](#4-bot-object--methods)
+5. [Events](#5-events)
+6. [Status values](#6-status-values)
+7. [Examples](#7-examples)
+8. [Performance notes and limits](#8-performance-notes-and-limits)
 
 ---
 
-## 2. Global fonksiyonlar
+## 1. How it works
 
-### Çıktı
+- Every script runs **in its own thread and its own Lua state**. An infinite loop in one script
+  slows down neither the bots nor the panel; you can run as many scripts at once as you like.
+- Bot commands (`warp`, `say`, `drop`...) are **queued** and run on the bot's own thread; the
+  function returns right away. Use the `waitFor...` functions or `wait()` to wait for the result.
+- Reads (`bot.world`, `bot.gems`...) always return the **current** value (locked, thread-safe).
+- **Event handlers** (`on(...)`) only run while the script is inside `sleep()`, `wait()`,
+  `listen()` or a `waitFor...` call. So handlers never run at the same time as your main code —
+  no locks, no race conditions.
+- When a script is stopped (**Stop** in the panel or `stopScript(id)`), the running code is
+  interrupted within a few milliseconds wherever it is (infinite loop, `sleep`, inside `pcall`).
+- `getBot()` without an argument returns the bot **selected in the panel** (or the first bot in
+  the list). The "Run for every bot" button starts one copy of the script per bot; in each copy
+  `getBot()` returns that bot.
 
-| Fonksiyon | Açıklama |
+On an error the script stops, and the error is written with its line number to the **Output**
+panel and the log.
+
+---
+
+## 2. Global functions
+
+### Output
+
+| Function | Description |
 |---|---|
-| `print(...)` | Script Output paneline yazar (değerler tab ile ayrılır). |
-| `log(...)` | Output'a **ve** ana Log sekmesine yazar (tag: `LUA:<script>`). |
-| `warn(...)` | `log` gibi ama uyarı (sarı) olarak. |
+| `print(...)` | Writes to the script Output panel (values separated by tabs). |
+| `log(...)` | Writes to Output **and** the main Log tab (tag: `LUA:<script>`). |
+| `warn(...)` | Like `log`, but as a warning (yellow). |
 
-### Zaman ve akış
+### Time and flow
 
-| Fonksiyon | Dönüş | Açıklama |
+| Function | Returns | Description |
 |---|---|---|
-| `sleep(ms)` | – | `ms` milisaniye bekler; beklerken olay handler'larını çalıştırır. |
-| `millis()` | integer | Script başladığından beri geçen ms. |
-| `listen([ms])` | – | Sadece olayları işleyerek bekler. Argümansız: script durdurulana kadar. |
-| `wait(event, [timeoutMs], [bot])` | `bot, değerler...` veya `nil` | Bir olayı bekler (aşağıya bak). `timeoutMs` yok/negatif = sonsuz. |
-| `exit()` | – | Scripti hatasız bitirir. |
-| `scriptId()` | integer | Bu scriptin id'si. |
-| `scriptName()` | string | Bu scriptin adı (dosya adı). |
+| `sleep(ms)` | – | Waits `ms` milliseconds; runs event handlers meanwhile. |
+| `millis()` | integer | Milliseconds since the script started. |
+| `listen([ms])` | – | Waits while only processing events. No argument: until the script is stopped. |
+| `wait(event, [timeoutMs], [bot])` | `bot, values...` or `nil` | Waits for an event (see below). No / negative `timeoutMs` = forever. |
+| `exit()` | – | Ends the script without an error. |
+| `scriptId()` | integer | This script's id. |
+| `scriptName()` | string | This script's name (file name). |
 
-`pcall` / `xpcall` normal Lua'daki gibi çalışır; tek fark, scriptin **durdurulmasını**
-yakalayamazlar (böylece `while true do pcall(sleep, 100) end` bile durdurulabilir).
+`pcall` / `xpcall` work as in normal Lua; the only difference is that they can't catch the
+script being **stopped** (so even `while true do pcall(sleep, 100) end` can be stopped).
 
-### Botlara erişim
+### Accessing bots
 
-| Fonksiyon | Dönüş | Açıklama |
+| Function | Returns | Description |
 |---|---|---|
-| `getBot()` | Bot | Panelde seçili bot (ya da scripte verilen bot). |
-| `getBot(n)` | Bot / nil | Listede `n`. sıradaki bot (1'den başlar). |
-| `getBot("isim")` | Bot / nil | GrowID'ye (büyük/küçük harf duyarsız), yoksa oyun içi isme göre. |
-| `getBotById(id)` | Bot / nil | Sabit bot id'sine göre (`bot.id`). |
-| `getBots()` | Bot dizisi | Bütün botlar, listedeki sırayla. |
-| `addBot(growid, password, [proxy])` | Bot veya `nil, hata` | Yeni bot ekler (başlatmaz; `bot:connect()` çağır). |
-| `removeBot(bot \| isim \| n)` | boolean | Botu durdurur ve listeden çıkarır. |
-| `connectAll()` | – | Bağlı olmayan tüm botları `login_interval_ms` aralıklarla bağlar. |
-| `disconnectAll()` | – | Tüm botların bağlantısını keser (offline'da bekler). |
+| `getBot()` | Bot | The bot selected in the panel (or the bot given to the script). |
+| `getBot(n)` | Bot / nil | The `n`th bot in the list (starts at 1). |
+| `getBot("name")` | Bot / nil | By GrowID (case-insensitive), then by in-game name. |
+| `getBotById(id)` | Bot / nil | By the fixed bot id (`bot.id`). |
+| `getBots()` | array of Bot | All bots, in list order. |
+| `addBot(growid, password, [proxy])` | Bot or `nil, error` | Adds a new bot (doesn't start it; call `bot:connect()`). |
+| `removeBot(bot \| name \| n)` | boolean | Stops the bot and removes it from the list. |
+| `connectAll()` | – | Connects every offline bot, spaced by `login_interval_ms`. |
+| `disconnectAll()` | – | Disconnects every bot (they stay offline). |
 
-Proxy formatı: `socks5://user:pass@host:port`, `socks5://host:port`, `host:port:user:pass` veya `host:port`.
+Proxy formats: `socks5://user:pass@host:port`, `socks5://host:port`, `host:port:user:pass` or `host:port`.
 
-### Olaylar
+### Events
 
-| Fonksiyon | Dönüş | Açıklama |
+| Function | Returns | Description |
 |---|---|---|
-| `on(event, function(bot, ...) end)` | handler id | Tüm botlar için handler ekler. `event = "*"` her olayı alır: `function(bot, eventName, ...)`. |
-| `off(id)` | silinen sayısı | Tek bir handler'ı siler. |
-| `off(event)` | silinen sayısı | O olayın bütün handler'larını siler. |
+| `on(event, function(bot, ...) end)` | handler id | Adds a handler for all bots. `event = "*"` receives every event: `function(bot, eventName, ...)`. |
+| `off(id)` | removed count | Removes one handler. |
+| `off(event)` | removed count | Removes every handler of that event. |
 
-### Script yönetimi
+### Script management
 
-| Fonksiyon | Dönüş | Açıklama |
+| Function | Returns | Description |
 |---|---|---|
-| `runScript(dosya, [bot])` | id veya `nil, hata` | `scripts/` içinden başka bir scripti ayrı thread'de başlatır. |
-| `stopScript(id)` | – | Bir scripti durdurur. |
-| `getScripts()` | dizi | `{ id, name, running, seconds }` tabloları. |
+| `runScript(file, [bot])` | id or `nil, error` | Starts another script from `scripts/` in its own thread. |
+| `stopScript(id)` | – | Stops a script. |
+| `getScripts()` | array | `{ id, name, running, seconds }` tables. |
+
+### Item info
+
+| Function | Returns | Description |
+|---|---|---|
+| `getItemName(id)` | string | `"Dirt"`, or `"#2"` while items.dat isn't loaded. |
+| `getItemId(name)` | integer / nil | Case-insensitive: `getItemId("dirt seed")`. |
+| `getItemInfo(id \| name)` | table / nil | `{ id, name, type, collision, category, rarity, hits, growTime, background, info }`. |
+| `itemsReady()` | boolean | items.dat is loaded. |
+
+Item names come from `items.dat`: first the `items.dat` next to `GrowtopiaBot.exe`, otherwise the
+game's cache (`%LOCALAPPDATA%\Growtopia\cache\items.dat`). While it isn't loaded, names are `"#id"`.
 
 ---
 
-## 3. Bot nesnesi — özellikler
+## 3. Bot object — properties
 
-Hepsi salt-okunur, her okuma güncel değeri verir: `bot.world`, `bot.gems`...
+All are read-only, and every read returns the current value: `bot.world`, `bot.gems`...
 
-| Özellik | Tip | Açıklama |
+| Property | Type | Description |
 |---|---|---|
-| `id` | integer | Sabit bot id'si (panelde `#`). `index` ile aynı. |
-| `growid` | string | config'deki GrowID. |
-| `name` | string | Oyun içi isim (renk kodsuz). |
-| `status` | string | Durum anahtarı, bkz. [bölüm 6](#6-durum-status-değerleri). |
-| `statusText` | string | Neden beklediği / durduğu ("server overloaded", "wrong GrowID / password"...). |
-| `online` | boolean | Oyunda mı (menu, joining veya in_world). |
-| `inWorld` | boolean | Bir world'ün içinde mi. |
-| `running` | boolean | Bot thread'i çalışıyor mu (stopped değil). |
-| `world` | string | Bulunduğu world (dışarıdaysa `""`). |
-| `worldWidth`, `worldHeight` | integer | World boyutu (tile). |
-| `targetWorld` | string | Kick / reconnect sonrası otomatik döneceği world. |
-| `x`, `y` | number | Pozisyon (piksel). |
-| `tileX`, `tileY` | integer | Pozisyon (tile; avatarın ortası, AquaProxy ile aynı hesap). |
-| `gems` | integer | Gem sayısı. |
-| `level` | integer | Seviye. |
+| `id` | integer | Fixed bot id (`#` in the panel). Same as `index`. |
+| `growid` | string | GrowID. |
+| `name` | string | In-game name (no color codes). |
+| `status` | string | Status key, see [section 6](#6-status-values). |
+| `statusText` | string | Why it's waiting / stopped ("server overloaded", "wrong GrowID / password"...). |
+| `online` | boolean | In game (menu, joining or in_world). |
+| `inWorld` | boolean | Inside a world. |
+| `running` | boolean | The bot thread is running (not stopped). |
+| `world` | string | Current world (`""` when outside). |
+| `worldWidth`, `worldHeight` | integer | World size in tiles. |
+| `targetWorld` | string | World it returns to after a kick / reconnect. |
+| `x`, `y` | number | Position in pixels. |
+| `tileX`, `tileY` | integer | Position in tiles (the avatar's centre, same rule as AquaProxy). |
+| `gems` | integer | Gem count. |
+| `level` | integer | Level. |
 | `ping` | integer | ms. |
-| `netID`, `userID` | integer | Sunucunun verdiği id'ler. |
-| `inventorySize` | integer | Envanter slot sayısı. |
-| `proxy` | string | `host:port` (şifre gösterilmez) veya `""`. |
-| `autoReconnect` | boolean | Kopunca otomatik bağlanır mı. |
-| `walking` | boolean | Şu an bir `walk` yürüyor mu. |
-| `autoCollect` | boolean | Yerdeki item'ları kendiliğinden topluyor mu. |
+| `netID`, `userID` | integer | Ids given by the server. |
+| `inventorySize` | integer | Inventory slot count. |
+| `proxy` | string | `host:port` (password hidden) or `""`. |
+| `autoReconnect` | boolean | Reconnects automatically when disconnected. |
+| `walking` | boolean | A `walk` is in progress. |
+| `autoCollect` | boolean | Collects dropped items by itself. |
 
-`tostring(bot)` → `Bot(#1 GROWID)`. İki bot nesnesi `==` ile karşılaştırılabilir.
+`tostring(bot)` → `Bot(#1 GROWID)`. Two bot objects can be compared with `==`.
 
 ---
 
-## 4. Bot nesnesi — metotlar
+## 4. Bot object — methods
 
-Metotlar `:` ile çağrılır: `bot:warp("START")`.
+Methods are called with `:`: `bot:warp("START")`.
 
-### Bağlantı
+### Connection
 
-| Metot | Açıklama |
+| Method | Description |
 |---|---|
-| `bot:connect([gecikmeMs])` | Giriş yapar. Bot durmuşsa (stopped) veya offline ise yeniden başlatır. |
-| `bot:disconnect()` | Bağlantıyı keser ve **offline** kalır (otomatik bağlanmaz). |
-| `bot:reconnect()` | Bağlantıyı keser ve hemen yeniden giriş yapar. |
-| `bot:setAutoReconnect(bool)` | Sunucu atınca otomatik bağlansın mı (varsayılan `true`). |
+| `bot:connect([delayMs])` | Logs in. Restarts the bot if it is stopped or offline. |
+| `bot:disconnect()` | Disconnects and stays **offline** (doesn't reconnect by itself). |
+| `bot:reconnect()` | Disconnects and logs in again right away. |
+| `bot:setAutoReconnect(bool)` | Reconnect automatically when the server drops the bot (default `true`). |
 
-### Hareket ve world
+### Movement and world
 
-| Metot | Açıklama |
+| Method | Description |
 |---|---|
-| `bot:warp(world, [kapıId])` | World'e gider (tek seferlik). |
-| `bot:warpAndWait(world, [timeoutMs=30000], [kapıId])` | Warp atar ve girene kadar bekler → `true/false`. |
-| `bot:leave()` | World'den çıkar (world menüsüne). |
-| `bot:setTargetWorld(world)` | Kalacağı world; atılınca / yeniden bağlanınca oraya döner. `""` = kapalı. |
-| `bot:walk(tileX, tileY)` | O tile'a **yol bularak** yürür (A*), hemen döner. Yeni `walk` eskisinin yerini alır. |
-| `bot:walkAndWait(tileX, tileY, [timeoutMs=30000])` | Yürür ve varana kadar bekler → `true` / `false, sebep`. |
-| `bot:stopWalk()` | Yürümeyi durdurur. |
-| `bot:findPath(tileX, tileY)` | Yürümeden yolu hesaplar → `{ {x, y}, ... }` (iki uç dahil) / `nil, sebep`. |
-| `bot:move(dx, [dy=0])` | Bulunduğu tile'a göre göreli yürüme (`walk` ile aynı). |
-| `bot:respawn()` | Respawn. |
-| `bot:enter(tileX, tileY)` | O tile'daki kapıya / portala girer (5x5 içindeyse) → `boolean`. |
+| `bot:warp(world, [doorId])` | Warps to a world (once). |
+| `bot:warpAndWait(world, [timeoutMs=30000], [doorId])` | Warps and waits until it's inside → `true/false`. |
+| `bot:leave()` | Leaves the world (to the world menu). |
+| `bot:setTargetWorld(world)` | World to stay in; it returns there after kicks / reconnects. `""` = off. |
+| `bot:walk(tileX, tileY)` | Walks to that tile **with pathfinding** (A*) and returns right away. A new `walk` replaces the running one. |
+| `bot:walkAndWait(tileX, tileY, [timeoutMs=30000])` | Walks and waits until it arrives → `true` / `false, reason`. |
+| `bot:stopWalk()` | Stops walking. |
+| `bot:findPath(tileX, tileY)` | Computes the route without walking → `{ {x, y}, ... }` (both ends included) / `nil, reason`. |
+| `bot:move(dx, [dy=0])` | Walks relative to the current tile (same as `walk`). |
+| `bot:respawn()` | Respawns. |
+| `bot:enter(tileX, tileY)` | Enters the door / portal on that tile (if inside the 5x5 reach) → `boolean`. |
 
-> **Pathfinding (AquaProxy'nin `/path`'i):** A* world'ün gerçek tile verisiyle çalışır: katı bloklar,
-> kapalı kapılar, erişimimiz olmayan entrance'lar, VIP / friends entrance'ları, tek yönlü bloklar ve
-> platformlar dikkate alınır; ateş / diken gibi zararlı tile'lardan mümkünse kaçınılır. Bot her pakette
-> **bir tile** ilerler (iki adım arka arkaya, sonra 80–200 ms rastgele bekleme), adımlar reliable
-> gönderilir (kaybolan adım sunucuda ışınlanma gibi görünürdü). Yol kapanırsa (kapı kapandı, blok
-> koyuldu, sunucu botu başka yere koydu) bulunduğu yerden yeniden hesaplar (en fazla 25 kez).
-> `items.dat` yoksa her ön plan bloğu katı sayılır, yani sadece boşluktan yürünür.
+> **Pathfinding (AquaProxy's `/path`):** A* runs on the world's real tile data: solid blocks,
+> closed doors, entrances we have no access to, VIP / friends entrances, one-way blocks and
+> platforms are respected, and harmful tiles like fire / spikes are avoided when possible. The bot
+> moves **one tile per packet** (two steps back to back, then a random 80–200 ms pause), and the
+> steps are sent reliably (a lost step would look like a teleport to the server). If the route
+> closes (a door shuts, a block is placed, the server moves the bot), it plans again from where it
+> really is (at most 25 times). Without items.dat every foreground block counts as solid, so it only
+> walks through air.
 
-### Konuşma ve diyaloglar
+### Chat and dialogs
 
-| Metot | Açıklama |
+| Method | Description |
 |---|---|
-| `bot:say(text)` / `bot:talk(text)` | Sohbete yazar. `/komut`lar da çalışır (`bot:say("/wave")`). |
-| `bot:dialogReturn(isim, alanlar)` | `action|dialog_return` gönderir. `alanlar`: `{ key = value }` veya sıralı olması gerekiyorsa `{ {"key", value}, ... }`. |
+| `bot:say(text)` / `bot:talk(text)` | Writes to chat. `/commands` work too (`bot:say("/wave")`). |
+| `bot:dialogReturn(name, fields)` | Sends `action|dialog_return`. `fields`: `{ key = value }` or, when order matters, `{ {"key", value}, ... }`. |
 
-### Envanter ve item
+### Inventory and items
 
-| Metot | Dönüş | Açıklama |
+| Method | Returns | Description |
 |---|---|---|
-| `bot:getInventory()` | dizi | `{ id, name, count, flags }` tabloları. |
-| `bot:getItemCount(id)` | integer | O itemden kaç tane var. |
-| `bot:hasItem(id, [adet=1])` | boolean | |
-| `bot:drop(id, [adet])` | boolean | Drop atar. `adet` yoksa hepsi. Yeterli item yoksa `false`. |
-| `bot:trash(id, [adet])` | boolean | Çöpe atar. `adet` yoksa hepsi. |
-| `bot:wear(id)` / `bot:unwear(id)` / `bot:use(id)` | – | Giy / çıkar / kullan (aynı paket: item activate). |
+| `bot:getInventory()` | array | `{ id, name, count, flags }` tables. |
+| `bot:getItemCount(id)` | integer | How many of that item it has. |
+| `bot:hasItem(id, [count=1])` | boolean | |
+| `bot:drop(id, [count])` | boolean | Drops the item. No `count` = all of them. `false` if there aren't enough. |
+| `bot:trash(id, [count])` | boolean | Trashes the item. No `count` = all of them. |
+| `bot:wear(id)` / `bot:unwear(id)` / `bot:use(id)` | – | Wear / unwear / use (same packet: item activate). |
 
-> Item isimleri `items.dat`'tan gelir: önce `GrowtopiaBot.exe`'nin yanındaki `items.dat`, yoksa oyunun
-> önbelleği (`%LOCALAPPDATA%\Growtopia\cache\items.dat`). Yüklenmemişse isim yerine `"#id"` döner.
+### Acting on the world
 
-### World ile etkileşim
-
-| Metot | Dönüş | Açıklama |
+| Method | Returns | Description |
 |---|---|---|
-| `bot:punch(tileX, tileY)` | boolean | Yumruk atar. |
-| `bot:place(tileX, tileY, itemId)` | boolean | Blok / tohum koyar (itemde yoksa yapmaz). |
-| `bot:wrench(tileX, tileY)` | boolean | Wrench kullanır. |
-| `bot:inReach(tileX, tileY)` | boolean | Tile botun 5x5 alanında mı. |
+| `bot:punch(tileX, tileY)` | boolean | Punches a tile. |
+| `bot:place(tileX, tileY, itemId)` | boolean | Places a block / seed (does nothing if it isn't in the inventory). |
+| `bot:wrench(tileX, tileY)` | boolean | Uses the wrench on a tile. |
+| `bot:inReach(tileX, tileY)` | boolean | The tile is inside the bot's 5x5 reach. |
 
-> ⚠️ **5x5 kuralı (ban koruması):** oyun yumruk / koyma / wrench / kapıya girmeyi sadece oyuncunun
-> etrafındaki 5x5 kare içinde (her eksende en fazla 2 tile) yapar. mstate / smstate ile spawn olan
-> karakter daha uzağa vurabilir, ama sunucu bu paketleri işaretler ve **banlar**. AquaProxy bunu uzak
-> paketleri düşürerek engelliyor; bot da aynısını yapar: 5x5 dışındaki her tile işlemi (ham
-> `sendPacket` dahil) **gönderilmez**, Log'a uyarı yazılır. Blok botun kendi tile'ına koyulamaz
-> (background koyulabilir). Dönüş değeri çağrı anındaki bu kontroldür; uzaktaysan önce
-> `walkAndWait` ile yaklaş.
+> ⚠️ **The 5x5 rule (ban protection):** the game only punches / places / wrenches / enters doors
+> inside the 5x5 square around the player (at most 2 tiles on either axis). A character spawned
+> with mstate / smstate can reach further, but the server flags those packets and **bans**.
+> AquaProxy blocks this by dropping the far packets; the bot does the same: every tile action
+> outside the 5x5 square (raw `sendPacket` included) is **not sent**, and a warning goes to the
+> Log. A block can't be placed on the bot's own tile (a background can). The return value is that
+> check at call time; if you are too far, get closer with `walkAndWait` first.
 
-### Tile verisi ve yerdeki item'lar
+### Tile data and dropped items
 
-| Metot | Dönüş | Açıklama |
+| Method | Returns | Description |
 |---|---|---|
-| `bot:getTile(tileX, tileY)` | tablo / nil | Tek tile (world dışıysa `nil`). |
-| `bot:getTiles()` | dizi | World'deki bütün tile'lar (100x60 = 6000 tablo; sık çağırma). |
-| `bot:findTiles(itemId)` | dizi | Ön planında veya arka planında o item olan tile'lar: `{ {x, y}, ... }`. |
-| `bot:getObjects()` | dizi | Yerdeki (drop edilmiş) item'lar. |
-| `bot:collect([yarıçap=2])` | integer | Yarıçap (tile, en fazla 2) içindeki item'ları toplar; menzildekilerin sayısını döner. Envantere sığmayanları (200'lük yığın, dolu çanta) almaz. |
-| `bot:setAutoCollect(bool, [yarıçap=2])` | – | Yürürken, yeni drop düşünce ve 0.5 s'de bir kendiliğinden toplar. |
+| `bot:getTile(tileX, tileY)` | table / nil | One tile (`nil` outside the world). |
+| `bot:getTiles()` | array | Every tile in the world (100x60 = 6000 tables; don't call it often). |
+| `bot:findTiles(itemId)` | array | Tiles with that item as foreground or background: `{ {x, y}, ... }`. |
+| `bot:getObjects()` | array | Dropped items in the world. |
+| `bot:collect([radius=2])` | integer | Collects the items within `radius` tiles (at most 2) and returns how many are in range. Skips what doesn't fit (full stack of 200, full backpack). |
+| `bot:setAutoCollect(bool, [radius=2])` | – | Collects by itself while walking, when something drops and every 0.5 s. |
 
-Tile tablosu: `{ x, y, fg, bg, fgName, bgName, flags, extraKind, walkable }`; kapı / tabelada `label`,
-kilitte `owner` (userID), ağaçta `age` (saniye), `fruit` ve `ready` (büyüdü mü) de vardır.
-Obje tablosu: `{ uid, id, name, count, x, y, tileX, tileY }`.
+Tile table: `{ x, y, fg, bg, fgName, bgName, flags, extraKind, walkable }`, plus `label` on doors /
+signs, `owner` (userID) on locks and `age` (seconds), `fruit` and `ready` (fully grown) on trees.
+Object table: `{ uid, id, name, count, x, y, tileX, tileY }`.
 
-Tile'lar world girişindeki harita paketinden okunur ve sunucunun tile güncellemeleriyle (kırma,
-koyma, tile update, ağaç hasadı) güncel tutulur.
+Tiles are read from the map packet when the bot enters a world and kept up to date with the
+server's tile updates (punches, places, tile updates, harvested trees).
 
-### Item bilgisi (global)
+### Players
 
-| Fonksiyon | Dönüş | Açıklama |
+| Method | Returns | Description |
 |---|---|---|
-| `getItemName(id)` | string | `"Dirt"`, yüklenmediyse `"#2"`. |
-| `getItemId(isim)` | integer / nil | Büyük/küçük harf duyarsız: `getItemId("dirt seed")`. |
-| `getItemInfo(id \| isim)` | tablo / nil | `{ id, name, type, collision, category, rarity, hits, growTime, background, info }`. |
-| `itemsReady()` | boolean | `items.dat` yüklendi mi. |
+| `bot:getPlayers()` | array | The other players in the world. |
+| `bot:getPlayer(name \| netID)` | table / nil | |
 
-### Oyuncular
+Player table: `{ netID, userID, name, country, x, y, tileX, tileY, moderator }`.
 
-| Metot | Dönüş | Açıklama |
+### Status queries and waiting
+
+Waiting methods run event handlers while they wait.
+
+| Method | Returns | Description |
 |---|---|---|
-| `bot:getPlayers()` | dizi | World'deki diğer oyuncular. |
-| `bot:getPlayer(isim \| netID)` | tablo / nil | |
+| `bot:getInfo()` | table | Every property from section 3 in one table. |
+| `bot:isOnline()` | boolean | Same as `bot.online`. |
+| `bot:isInWorld([world])` | boolean | In a world (or in the given world). |
+| `bot:waitForOnline([timeoutMs=60000])` | boolean | Waits until it's logged in. |
+| `bot:waitForWorld([world], [timeoutMs=30000])` | boolean | Waits until it enters a world (or the given one). |
+| `bot:waitForStatus(status, [timeoutMs=30000])` | boolean | Waits until `bot.status == status`. |
+| `bot:on(event, function(bot, ...) end)` | handler id | Events of **this bot only**. |
+| `bot:wait(event, [timeoutMs])` | `bot, values...` / nil | Waits for an event of this bot only. |
 
-Oyuncu tablosu: `{ netID, userID, name, country, x, y, tileX, tileY, moderator }`.
+### Raw packets (advanced)
 
-### Durum sorgulama ve bekleme
-
-Bekleyen metotlar beklerken olay handler'larını çalıştırır.
-
-| Metot | Dönüş | Açıklama |
-|---|---|---|
-| `bot:getInfo()` | tablo | Bölüm 3'teki bütün özellikler tek tabloda. |
-| `bot:isOnline()` | boolean | `bot.online` ile aynı. |
-| `bot:isInWorld([world])` | boolean | Bir world'de (veya verilen world'de) mi. |
-| `bot:waitForOnline([timeoutMs=60000])` | boolean | Giriş yapana kadar bekler. |
-| `bot:waitForWorld([world], [timeoutMs=30000])` | boolean | Bir world'e (veya verilene) girene kadar. |
-| `bot:waitForStatus(status, [timeoutMs=30000])` | boolean | `bot.status == status` olana kadar. |
-| `bot:on(event, function(bot, ...) end)` | handler id | Sadece **bu botun** olayları. |
-| `bot:wait(event, [timeoutMs])` | `bot, değerler...` / nil | Sadece bu botun olayını bekler. |
-
-### Ham paketler (ileri seviye)
-
-| Metot | Açıklama |
+| Method | Description |
 |---|---|
-| `bot:sendText(text)` | `NET_MESSAGE_GENERIC_TEXT` (2). Örn. `"action|respawn\n"`. |
-| `bot:sendGameMessage(text)` | `NET_MESSAGE_GAME_MESSAGE` (3). Örn. `"action|quit_to_exit\n"`. |
-| `bot:sendPacket(tablo)` | Tank paketi (`NET_MESSAGE_GAME_PACKET`). |
+| `bot:sendText(text)` | `NET_MESSAGE_GENERIC_TEXT` (2). E.g. `"action|respawn\n"`. |
+| `bot:sendGameMessage(text)` | `NET_MESSAGE_GAME_MESSAGE` (3). E.g. `"action|quit_to_exit\n"`. |
+| `bot:sendPacket(table)` | Tank packet (`NET_MESSAGE_GAME_PACKET`). |
 
-`sendPacket` alanları (hepsi isteğe bağlı, varsayılan 0): `type, objectType, count1, count2,
-netID, targetNetID, flags, floatValue, value, x, y, xSpeed, ySpeed, particle, punchX, punchY`,
-ve `reliable` (varsayılan `true`).
+`sendPacket` fields (all optional, default 0): `type, objectType, count1, count2, netID,
+targetNetID, flags, floatValue, value, x, y, xSpeed, ySpeed, particle, punchX, punchY`, and
+`reliable` (default `true`). Tile packets go through the same 5x5 reach guard, and a state packet
+moves the bot's position to its `x, y`.
 
 ```lua
--- yumruk animasyonuyla state paketi
+-- state packet with a punch animation
 bot:sendPacket({ type = 0, x = bot.x, y = bot.y, punchX = 10, punchY = 20, flags = 0x200 | 0x20, reliable = false })
 ```
 
 ---
 
-## 5. Olaylar (events)
+## 5. Events
 
-Handler'ın ilk argümanı **her zaman bot nesnesi**, ardından tablodaki değerler gelir:
+The first handler argument is **always the bot object**, followed by the values in the table:
 
 ```lua
 on("console", function(bot, text, raw) print(bot.name, text) end)
 local bot, world, w, h = wait("world_enter", 10000)
 ```
 
-| Olay | Değerler (bot'tan sonra) | Ne zaman |
+| Event | Values (after bot) | When |
 |---|---|---|
-| `status` | `status, statusText` | Durum değişince. |
-| `connected` | – | ENet bağlantısı kuruldu (giriş öncesi). |
-| `login` | – | Giriş kabul edildi, oyuna giriyor. |
-| `logon_fail` | `sebep` | Giriş reddedildi (2FA, overload, maintenance...). |
-| `disconnected` | `sebep` | Bağlantı koptu. |
-| `world_enter` | `world, genişlik, yükseklik` | World'e girdi. |
-| `world_menu` | `çıkılanWorld` | World menüsüne döndü (çıktı / atıldı). |
-| `join_fail` | `world` | World'e giremedi. |
-| `spawn` | `netID, userID, x, y` | Bot world'de doğdu. |
-| `player_join` | `netID, isim, userID, ülke, moderatörMü` | Biri world'e girdi. |
-| `player_leave` | `netID, isim` | Biri world'den çıktı. |
-| `moderator` | `isim, netID` | World'e moderatör/görünmez biri girdi. |
-| `console` | `text, rawText` | Konsol mesajı (`text` renk kodsuz). |
-| `talk` | `netID, isim, text` | Sohbet balonu (kendi mesajların dahil). |
-| `dialog` | `dialogText` | Sunucu diyalog açtı (`OnDialogRequest`). |
-| `inventory` | `itemSayısı, slotSayısı` | Envanterin tamamı geldi. |
-| `item` | `itemId, değişim, yeniAdet` | Item kazanıldı (+) / kaybedildi (−). |
-| `gems` | `gems` | Gem sayısı değişti. |
-| `variant` | `fonksiyonAdı, arg1, arg2, ...` | Sunucudan gelen **her** `OnXxx` çağrısı (vec2/vec3 değerler `"x, y"` metni). |
-| `packet` | `type, netID, value, x, y, punchX, punchY, flags` | Gelen her tank paketi. **Yoğun**: sadece gerekiyorsa dinle. |
-| `text` | `text` | Ham `GENERIC_TEXT` mesajı. |
-| `game_message` | `text` | Ham `GAME_MESSAGE` (`action|log` vb.). |
-| `arrived` | `tileX, tileY` | `walk` hedefe vardı. |
-| `path_fail` | `sebep, tileX, tileY` | `walk` bitti ama varamadı (yol yok, world değişti, durduruldu...). |
-| `tile_change` | `tileX, tileY, fg, bg` | Bir tile değişti (kırıldı, koyuldu, güncellendi). |
-| `object_drop` | `uid, itemId, adet, x, y` | Yere yeni bir item düştü. |
-| `object_take` | `netID, itemId, adet` | Başka bir oyuncu yerden item aldı. |
-| `collect` | `itemId, adet, uid` | Bot yerden item topladı. |
-| `*` | `olayAdı, değerler...` | Hepsi (yoğun). |
+| `status` | `status, statusText` | The status changed. |
+| `connected` | – | ENet connection established (before login). |
+| `login` | – | Login accepted, entering the game. |
+| `logon_fail` | `reason` | Login rejected (2FA, overload, maintenance...). |
+| `disconnected` | `reason` | Connection lost. |
+| `world_enter` | `world, width, height` | Entered a world. |
+| `world_menu` | `leftWorld` | Back at the world menu (left / kicked). |
+| `join_fail` | `world` | Couldn't enter the world. |
+| `spawn` | `netID, userID, x, y` | The bot spawned in the world. |
+| `player_join` | `netID, name, userID, country, isModerator` | Someone entered the world. |
+| `player_leave` | `netID, name` | Someone left the world. |
+| `moderator` | `name, netID` | A moderator / invisible player entered the world. |
+| `console` | `text, rawText` | Console message (`text` without color codes). |
+| `talk` | `netID, name, text` | Chat bubble (including your own). |
+| `dialog` | `dialogText` | The server opened a dialog (`OnDialogRequest`). |
+| `inventory` | `itemCount, slotCount` | The full inventory arrived. |
+| `item` | `itemId, change, newCount` | Item gained (+) / lost (−). |
+| `gems` | `gems` | The gem count changed. |
+| `variant` | `functionName, arg1, arg2, ...` | **Every** `OnXxx` call from the server (vec2/vec3 values as `"x, y"` text). |
+| `packet` | `type, netID, value, x, y, punchX, punchY, flags` | Every incoming tank packet. **Heavy**: only listen when you need it. |
+| `text` | `text` | Raw `GENERIC_TEXT` message. |
+| `game_message` | `text` | Raw `GAME_MESSAGE` (`action|log` etc.). |
+| `arrived` | `tileX, tileY` | A `walk` reached its target. |
+| `path_fail` | `reason, tileX, tileY` | A `walk` ended without arriving (no way, world changed, stopped...). |
+| `tile_change` | `tileX, tileY, fg, bg` | A tile changed (broken, placed, updated). |
+| `object_drop` | `uid, itemId, count, x, y` | Something was dropped in the world. |
+| `object_take` | `netID, itemId, count` | Another player picked something up. |
+| `collect` | `itemId, count, uid` | The bot picked something up. |
+| `*` | `eventName, values...` | Everything (heavy). |
 
-Notlar:
+Notes:
 
-- Bir olay **dinlenmiyorsa hiç üretilmez** (maliyeti ~0.5 ns). `packet`/`*` gibi yoğun olayları
-  sadece gerektiğinde dinle, işin bitince `off(...)` yap.
-- Her scriptin olay kuyruğu 20 000 olayla sınırlıdır; script hiç `sleep`/`wait` çağırmadan uzun
-  süre meşgul kalırsa en eski olaylar düşer (panelde "dropped" sayısı görünür).
-- Handler içinde `sleep`/`wait` kullanılabilir; o sırada gelen olaylar handler bitince işlenir.
-- Handler hata verirse hata Output'a yazılır, script **devam eder**.
+- An event nobody listens to is **never created** (~0.5 ns cost). Only listen to heavy events like
+  `packet` / `*` when you need them, and `off(...)` them when you're done.
+- Each script's event queue holds at most 20 000 events; if a script stays busy for a long time
+  without calling `sleep`/`wait`, the oldest events are dropped (the panel shows a "dropped" count).
+- `sleep`/`wait` can be used inside a handler; events arriving meanwhile are handled after it.
+- If a handler fails, the error goes to Output and the script **keeps running**.
 
 ---
 
-## 6. Durum (status) değerleri
+## 6. Status values
 
-| `bot.status` | Anlamı |
+| `bot.status` | Meaning |
 |---|---|
-| `idle` | Henüz başlatılmadı. |
-| `logging_in` | HTTP giriş (server_data / token). |
-| `connecting` | Sunucuya bağlanıyor. |
-| `entering_game` | Giriş kabul edildi, menüyü bekliyor. |
-| `menu` | Oyunda, world seçme menüsünde. |
-| `joining` | World'e giriyor. |
-| `in_world` | Bir world'ün içinde. |
-| `waiting` | Bekliyor (2FA, overload, maintenance, ağ hatası, login sırası). Sebep: `bot.statusText`. |
-| `offline` | `disconnect()` ile kapatıldı; `connect()` bekliyor. |
-| `stopped` | Durdu (yanlış şifre, deneme hakkı bitti, güncelleme gerekli, auto-reconnect kapalıyken kopma). `connect()` yeniden başlatır. |
+| `idle` | Not started yet. |
+| `logging_in` | HTTP login (server_data / token). |
+| `connecting` | Connecting to the server. |
+| `entering_game` | Login accepted, waiting for the menu. |
+| `menu` | In game, at the world select menu. |
+| `joining` | Joining a world. |
+| `in_world` | Inside a world. |
+| `waiting` | Waiting (2FA, overload, maintenance, network error, login queue). Reason: `bot.statusText`. |
+| `offline` | Closed with `disconnect()`; waiting for `connect()`. |
+| `stopped` | Stopped (wrong password, out of login attempts, update required, disconnected while auto-reconnect is off). `connect()` restarts it. |
 
 ---
 
-## 7. Örnekler
+## 7. Examples
 
-### Bilgi okuma
+### Read bot info
 
 ```lua
 local bot = getBot()
 print(bot.name, bot.status, bot.world, bot.gems .. " gems", bot.ping .. " ms")
-for _, item in ipairs(bot:getInventory()) do print(item.id, item.count) end
+for _, item in ipairs(bot:getInventory()) do print(item.id, item.name, item.count) end
 for _, p in ipairs(bot:getPlayers()) do print(p.name, p.tileX, p.tileY, p.moderator) end
 ```
 
-### Bağlan, world'e git, konuş
+### Connect, warp, chat
 
 ```lua
 local bot = getBot()
 if not bot.online then
     bot:connect()
-    assert(bot:waitForOnline(60000), "giriş olmadı: " .. bot.statusText)
+    assert(bot:waitForOnline(60000), "login failed: " .. bot.statusText)
 end
-if bot:warpAndWait("START") then bot:say("selam!") end
+if bot:warpAndWait("START") then bot:say("hello!") end
 ```
 
-### Bütün botlar
+### All bots
 
 ```lua
 for _, bot in ipairs(getBots()) do
@@ -386,30 +388,30 @@ for _, bot in ipairs(getBots()) do
 end
 ```
 
-### Olaylara tepki
+### React to events
 
 ```lua
 on("talk", function(bot, netID, name, text)
-    if text == "!gems" then bot:say(name .. ", " .. bot.gems .. " gem var") end
+    if text == "!gems" then bot:say(name .. ", I have " .. bot.gems .. " gems") end
 end)
 on("moderator", function(bot, name)
-    warn("mod geldi: " .. name)
+    warn("moderator joined: " .. name)
     bot:leave()
 end)
-on("disconnected", function(bot, reason) log(bot.name .. " koptu: " .. reason) end)
+on("disconnected", function(bot, reason) log(bot.name .. " disconnected: " .. reason) end)
 listen()
 ```
 
-### Bir şeyi bekle
+### Wait for something
 
 ```lua
 local bot = getBot()
 bot:say("/time")
 local b, text = bot:wait("console", 5000)
-if b then print("sunucu cevabı:", text) else print("cevap gelmedi") end
+if b then print("server answer:", text) else print("no answer") end
 ```
 
-### Belli miktarda item olunca drop
+### Drop items when there are enough
 
 ```lua
 local bot = getBot()
@@ -417,58 +419,58 @@ while true do
     if bot.inWorld and bot:getItemCount(242) >= 50 then
         bot:warpAndWait("DEPOSIT")
         if bot:walkAndWait(10, 20) then
-            bot:drop(242)          -- hepsini
+            bot:drop(242)          -- all of them
         end
-        sleep(1000)
     end
     sleep(5000)
 end
 ```
 
-### Yürü, kır, topla
+### Walk, break, collect
 
 ```lua
 local bot = getBot()
 local ok, why = bot:walkAndWait(30, 20)
-if not ok then error("varamadım: " .. why) end
+if not ok then error("couldn't get there: " .. why) end
 local tile = bot:getTile(31, 20)
 print(tile.fgName, tile.walkable)
 while bot:getTile(31, 20).fg ~= 0 do
-    bot:punch(31, 20)          -- 5x5 içinde
+    bot:punch(31, 20)          -- inside the 5x5 reach
     sleep(250)
 end
 sleep(500)
-print("topluyor:", bot:collect())
+print("collecting:", bot:collect())
 ```
 
-### Diyalog doldurma
+### Fill in a dialog
 
 ```lua
 bot:dialogReturn("drop_item", { {"itemID", "242|"}, {"count", 10} })
 ```
 
-### Yeni bot ekleme
+### Add a new bot
 
 ```lua
-local bot, err = addBot("YENIBOT", "sifre", "socks5://user:pass@1.2.3.4:1080")
+local bot, err = addBot("NEWBOT", "password", "socks5://user:pass@1.2.3.4:1080")
 if not bot then error(err) end
-bot:connect()   -- bot program kapanana kadar listede kalır; diske kaydedilmez
+bot:connect()   -- stays in the list until the program closes; nothing is saved to disk
 ```
 
-Daha fazlası: `Docs/examples/` (`example_basic.lua`, `example_events.lua`,
-`example_multibot.lua`, `example_deposit.lua`).
+More: `Docs/examples/` (`example_basic.lua`, `example_events.lua`, `example_multibot.lua`,
+`example_deposit.lua`).
 
 ---
 
-## 8. Performans notları ve sınırlar
+## 8. Performance notes and limits
 
-- Okuma maliyeti: `bot.gems` ≈ 0.1 µs, `bot:getInventory()` ≈ 0.25 µs, `bot:getPlayers()` ≈ 0.8 µs.
-  Sıkı döngülerde bile rahat (ölçümler: `Docs/PERFORMANCE.md`).
-- Komut kuyruğa alma (`say`, `drop`...) ≈ 0.3 µs; bot thread'i anında uyanır (~0.3 ms).
-- **Oyunun kendisi** hızlı komutları sevmez: aynı anda çok sayıda warp/drop/say spam'i
-  sunucudan kick/ban sebebi olabilir. Aralara `sleep` koy, girişleri `connectAll()` gibi aralıklı yap.
-- Harita okuma ~70 µs, A* 7–50 µs (100x60 world, `--bench` bölüm 6); 100 bot world'deyken bile
-  CPU değişmez.
-- 5x5 dışına yumruk / koyma / wrench / kapı ve 2 tile'dan uzaktaki item'ı toplama **hiç gönderilmez**.
-- Script içinden `io`/`os` gibi standart kütüphaneler açık (dosya okuma/yazma yapılabilir) — sadece
-  güvendiğin scriptleri çalıştır.
+- Read cost: `bot.gems` ≈ 0.1 µs, `bot:getInventory()` ≈ 0.25 µs, `bot:getPlayers()` ≈ 0.8 µs.
+  Fine even in tight loops (measurements: `Docs/PERFORMANCE.md`).
+- Queuing a command (`say`, `drop`...) ≈ 0.3 µs; the bot thread wakes up immediately (~0.3 ms).
+- Reading a map ~70 µs, A* 7–50 µs (100x60 world, `--bench` section 6); the CPU use doesn't change
+  even with 100 bots in worlds.
+- **The game itself** doesn't like fast commands: spamming warp / drop / say can get you kicked or
+  banned. Put `sleep` between commands and space out logins (e.g. `connectAll()`).
+- Punches / places / wrenches / door entries outside the 5x5 reach and pickups of items more than
+  2 tiles away are **never sent**.
+- Standard libraries like `io` / `os` are enabled in scripts (files can be read and written) — only
+  run scripts you trust.

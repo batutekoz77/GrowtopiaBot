@@ -1,113 +1,113 @@
-# Performans
+# Performance
 
-GrowtopiaBot'un içinde kendi test araçları var. Hiçbiri gerçek Growtopia sunucusuna ya da hesaba
-dokunmaz: bot'lar, `127.0.0.1` üzerinde çalışan **sahte bir ENet sunucusuna** bağlanır. Bu sunucu
-login → world → trafik akışını taklit eder ve kendi CPU'su ölçümden düşülür.
+GrowtopiaBot has its own test tools built in. None of them touch the real Growtopia server or any
+account: the bots connect to a **fake ENet server** running on `127.0.0.1`. It imitates the
+login → world → traffic flow, and its own CPU is subtracted from the measurements.
 
 ```
-GrowtopiaBot.exe --bench [bot=50] [saniye=10] [bot başına paket/s=20]   -> bench_result.txt
-GrowtopiaBot.exe --bench-ui [bot=100] [saniye=8]                        -> bench_ui_result.txt (pencere açılır)
-GrowtopiaBot.exe --selftest                                              -> selftest_result.txt (Lua API testleri)
+GrowtopiaBot.exe --bench [bots=50] [seconds=10] [packets/s per bot=20]   -> bench_result.txt
+GrowtopiaBot.exe --bench-ui [bots=100] [seconds=8]                       -> bench_ui_result.txt (opens a window)
+GrowtopiaBot.exe --selftest                                              -> selftest_result.txt (Lua API tests)
 ```
 
-CPU, `QueryProcessCycleTime` / `QueryThreadCycleTime` ile ölçülür (çevrim sayacı).
-`GetProcessTimes` 15.6 ms'lik tick'lerle saydığı için kısa aralıklarla çalışan thread'lerde
-(event-driven bot, boşta bekleyen panel) yanlış sonuç veriyor.
+CPU is measured with `QueryProcessCycleTime` / `QueryThreadCycleTime` (cycle counter).
+`GetProcessTimes` counts in 15.6 ms ticks, so it gives wrong results for threads that run in short
+bursts (the event-driven bots, the idle panel).
 
-## Sonuçlar (12 çekirdek, 100 bot, bot başına 20 paket/s world trafiği)
+## Results (12 cores, 100 bots, 20 packets/s of world traffic per bot)
 
-### Bot ağ döngüsü
+### Bot network loop
 
-| | Önce (5 ms sabit poll) | Sonra (wake socket + 50 ms) | Fark |
+| | Before (fixed 5 ms poll) | After (wake socket + 50 ms) | Difference |
 |---|---|---|---|
-| CPU (100 bot) | 61.3 % (bir çekirdeğin) | 14.5 % | **−76 %** |
-| Bot başına uyanma | 205 /s | 31 /s | **−85 %** |
-| Komut gecikmesi (ortalama) | 2.76 ms | 0.36 ms | **7.7× daha hızlı** |
-| Komut gecikmesi (p99) | 37.8 ms | 2.28 ms | |
-| İşlenen paket | 2207 /s | 2192 /s | aynı |
+| CPU (100 bots) | 61.3 % (of one core) | 14.5 % | **−76 %** |
+| Wake-ups per bot | 205 /s | 31 /s | **−85 %** |
+| Command latency (avg) | 2.76 ms | 0.36 ms | **7.7× faster** |
+| Command latency (p99) | 37.8 ms | 2.28 ms | |
+| Packets handled | 2207 /s | 2192 /s | same |
 
-Makine boşken yapılan diğer koşularda oran −72 % ile −82 % arasındaydı. Makine yüklüyken mutlak
-değerler değişiyor, ama önce/sonra oranı her koşuda korundu.
+Other runs on an idle machine gave between −72 % and −82 %. On a busy machine the absolute values
+change, but the before/after ratio held in every run.
 
-**Ne değişti:**
-- Eskiden her bot thread'i `select()` ile **5 ms'de bir** uyanıyordu (bot başına 200/s), bir şey
-  olsa da olmasa da. Artık thread ENet / proxy soketlerinde ve bir **wake socket**'te
-  (127.0.0.1 UDP) uyuyor. Paket gelince ya da panelden / scriptten komut gelince (`Post()`)
-  **anında** uyanıyor. Zaman aşımı (50 ms) sadece ENet'in kendi zamanlayıcıları için
-  (resend / ping); bunlar zaten ≥50 ms adımlarla çalışıyor.
-- Offline / bekleyen botlar 50 ms yerine 250 ms'de bir uyanıyor (komut gelirse yine anında).
-- Ping değeri sadece değiştiğinde yazılıyor (eskiden her döngüde kilit alınıyordu).
-- `Log::Debug` debug kapalıyken metni hiç formatlamıyor.
-- Her bot eskiden ayarlardaki **bütün bot listesinin** bir kopyasını tutuyordu (N bot →
-  N² kayıt, şifreler dahil). Artık sadece ortak ayarları tutuyor (`Config::Common`).
-- Konsol çıktısı (Windows konsolu çok yavaştır) varsayılan olarak kapalı. Loglar panelde bir
-  ring buffer'da tutuluyor: 4 thread'den saniyede ~2.5 milyon satır.
+**What changed:**
+- Every bot thread used to wake up with `select()` **every 5 ms** (200/s per bot), whether anything
+  happened or not. Now the thread sleeps on the ENet / proxy sockets and a **wake socket**
+  (127.0.0.1 UDP). It wakes up **immediately** when a packet arrives or a command comes from the
+  panel / a script (`Post()`). The timeout (50 ms) is only there for ENet's own timers
+  (resends / pings), which run in ≥50 ms steps anyway.
+- Offline / waiting bots wake up every 250 ms instead of 50 ms (still immediately on a command).
+- The ping value is only written when it changes (the lock used to be taken on every loop).
+- `Log::Debug` doesn't format the text at all while debug logging is off.
+- Every bot used to keep a copy of the **whole bot list** from the settings (N bots → N² entries,
+  passwords included). Now it only keeps the common settings (`Config::Common`).
+- Console output (the Windows console is very slow) is off by default. Logs are kept in a ring
+  buffer for the panel: ~2.5 million lines per second from 4 threads.
 
-**Düzeltilen hatalar (test sırasında bulundu):**
-- *Kaçan uyandırma:* wake bayrağı soket boşaltılmadan **önce** temizlenince, araya giren bir
-  komut 50 ms (offline'da 250 ms) bekleyebiliyordu. `--bench` içindeki doğruluk testi eski
-  sırayla 6000 komutta **272 kaçırma** buldu, düzeltmeden sonra **0**.
-- *OnSpawn pozisyonu:* `posXY` geçici bir string'in `string_view`'ıyla parse ediliyordu (dangling).
-  Botun kendi X pozisyonu rastgele bozulabiliyordu. `--selftest` yakaladı, düzeltildi.
+**Bugs fixed (found while testing):**
+- *Missed wake-up:* when the wake flag was cleared **before** draining the socket, a command in
+  between could wait 50 ms (250 ms when offline). The correctness test in `--bench` found
+  **272 misses** in 6000 commands with the old order, **0** after the fix.
+- *OnSpawn position:* `posXY` was parsed through a `string_view` of a temporary string (dangling).
+  The bot's own X position could get corrupted at random. `--selftest` caught it, fixed.
 
-### World verisi ve pathfinding (`--bench` bölüm 6)
+### World data and pathfinding (`--bench` section 6)
 
-Sahte sunucunun 100x60 haritası (duvarlı), 2000 tekrarın ortalaması:
+The fake server's 100x60 map (with a wall), average of 2000 repetitions:
 
-| İşlem | Süre |
+| Operation | Time |
 |---|---|
-| Harita paketini okuma (48 KB, 6000 tile) | ~71 µs |
-| A* duvarın etrafından (25 tile) | ~7 µs |
-| A* world boyunca (108 tile) | ~11 µs |
-| A* hedefe yol yok (bütün açık alanı tarar) | ~52 µs |
+| Reading the map packet (48 KB, 6000 tiles) | ~71 µs |
+| A* around the wall (25 tiles) | ~7 µs |
+| A* across the world (108 tiles) | ~11 µs |
+| A* with no way to the target (searches the whole open area) | ~52 µs |
 
-Her bot kendi world'ünü tutar; tile başına 24 byte (ek veri sadece kapı, tabela, kilit, ağaç gibi
-tile'larda ayrıca ayrılır), yani 100x60 bir world ≈ 144 KB. 100 bot world'deyken ağ döngüsünün
-CPU'su değişmedi: bu makinede eski loop 11.3 %, yeni loop **5.0 %** (bir çekirdeğin), p99 komut
-gecikmesi 3.1 ms.
+Every bot keeps its own world; 24 bytes per tile (extra data is only allocated for tiles that have
+it, like doors, signs, locks and trees), so a 100x60 world is ≈ 144 KB. With 100 bots in a world the
+network loop's CPU didn't change: on this machine the old loop used 11.3 %, the new loop **5.0 %**
+(of one core), p99 command latency 3.1 ms.
 
-**Bulunan hata:** yürüme adımları başta (Mori gibi) unreliable gönderiliyordu. `--selftest`'teki sahte
-sunucu her state paketinde pozisyon farkını kontrol ediyor ve 2–3 tile'lık **ışınlanmalar** yakaladı:
-ENet'in throttle'ı unreliable paketleri düşürebiliyor, kaybolan adım sunucuda ışınlanma gibi görünüyor.
-Adımlar artık reliable; 6 koşuda 0 ışınlanma, 0 menzil (5x5) ihlali.
+**Bug found:** walk steps were first sent unreliably (like Mori). The fake server in `--selftest`
+checks the position change of every state packet and caught 2–3 tile **teleports**: ENet's
+throttle can drop unreliable packets, and a lost step looks like a teleport to the server. Steps
+are now reliable; 6 runs, 0 teleports, 0 reach (5x5) violations.
 
-### Lua API (tek script, world içindeki bot)
+### Lua API (one script, bot in a world)
 
-| İşlem | Maliyet |
+| Operation | Cost |
 |---|---|
-| `bot.gems`, `bot.world` (özellik okuma) | 0.10 – 0.25 µs |
+| `bot.gems`, `bot.world` (property read) | 0.10 – 0.25 µs |
 | `bot:getItemCount(id)` | 0.13 – 0.36 µs |
 | `bot:getInventory()` | 0.25 – 0.53 µs |
 | `bot:getPlayers()` | 0.8 – 1.7 µs |
-| `bot:sendText(...)` (komut kuyruğa) | 0.3 – 0.8 µs |
-| Olay üretimi (`Emit`) | 150 – 360 ns |
-| Lua'da işlenen olay | 300 000 – 385 000 /s |
-| Dinlenmeyen olay kontrolü | ~0.5 ns |
+| `bot:sendText(...)` (queue a command) | 0.3 – 0.8 µs |
+| Creating an event (`Emit`) | 150 – 360 ns |
+| Events handled in Lua | 300 000 – 385 000 /s |
+| Checking an event nobody listens to | ~0.5 ns |
 
-Aralıklar, makine boşken ve yüklüyken yapılan koşulardan geliyor. Her script kendi thread'inde
-çalışıyor; yoğun bir script bot thread'lerini beklemiyor.
+The ranges come from runs on an idle and a busy machine. Every script runs in its own thread; a
+busy script never makes the bot threads wait.
 
-### Panel (300 canlı bot)
+### Panel (300 live bots)
 
-| Durum | FPS | CPU (bir çekirdeğin) |
+| State | FPS | CPU (of one core) |
 |---|---|---|
-| Kullanırken (her kare çizilir) | 60–144 | ~3 % (kare başı 0.12 ms UI + 0.09 ms DirectX) |
-| Boşta / arka planda | ~9–30 | ~1 % |
-| Simge durumunda / tamamen kapalı | 0 | ~0 % |
+| In use (every frame is drawn) | 60–144 | ~3 % (0.12 ms UI + 0.09 ms DirectX per frame) |
+| Idle / in the background | ~9–30 | ~1 % |
+| Minimized / fully covered | 0 | ~0 % |
 
-Açılış maliyeti bir kerelik: DirectX + font atlası, 0.4–1 s. Bot verisi her karede değil,
-saniyede 10 kez okunuyor. Uzun listeler (bot tablosu, log, script çıktısı) `ImGuiListClipper`
-ile sadece ekranda görünen satırları çiziyor.
+Start-up cost is paid once: DirectX + the font atlas, 0.4–1 s. Bot data is read 10 times a second,
+not every frame. Long lists (bot table, log, script output) only draw the visible rows with
+`ImGuiListClipper`.
 
-### Script satır izleme (editördeki renkler)
+### Script line tracing (the colors in the editor)
 
-Sadece editörden (Run / F5) çalıştırılan **tek** script izlenir; diğer bütün scriptler (
-`runScript`, "Run for every bot"daki diğer botlar) satır hook'u olmadan çalışır, maliyetleri sıfır.
-İzlenen scriptte her yeni satır bir hook çağrısı demek:
+Only the **one** script started from the editor (Run / F5) is traced; every other script
+(`runScript`, the other bots of "Run for every bot") runs without the line hook at zero cost.
+In the traced script every new line means one hook call:
 
-| Saf Lua döngüsü (3 satır / tur) | tur/s |
+| Plain Lua loop (3 lines per round) | rounds/s |
 |---|---|
-| İzleme kapalı | ~67 milyon |
-| İzleme açık | ~9 milyon (satır başına ~30 ns) |
+| Tracing off | ~67 million |
+| Tracing on | ~9 million (~30 ns per line) |
 
-Bot API'si / `sleep` ağırlıklı normal scriptlerde fark hissedilmez.
+In normal scripts, which mostly call the bot API / `sleep`, there is no noticeable difference.
