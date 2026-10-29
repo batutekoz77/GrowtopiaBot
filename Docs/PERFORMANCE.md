@@ -50,6 +50,27 @@ değerler değişiyor, ama önce/sonra oranı her koşuda korundu.
 - *OnSpawn pozisyonu:* `posXY` geçici bir string'in `string_view`'ıyla parse ediliyordu (dangling).
   Botun kendi X pozisyonu rastgele bozulabiliyordu. `--selftest` yakaladı, düzeltildi.
 
+### World verisi ve pathfinding (`--bench` bölüm 6)
+
+Sahte sunucunun 100x60 haritası (duvarlı), 2000 tekrarın ortalaması:
+
+| İşlem | Süre |
+|---|---|
+| Harita paketini okuma (48 KB, 6000 tile) | ~71 µs |
+| A* duvarın etrafından (25 tile) | ~7 µs |
+| A* world boyunca (108 tile) | ~11 µs |
+| A* hedefe yol yok (bütün açık alanı tarar) | ~52 µs |
+
+Her bot kendi world'ünü tutar; tile başına 24 byte (ek veri sadece kapı, tabela, kilit, ağaç gibi
+tile'larda ayrıca ayrılır), yani 100x60 bir world ≈ 144 KB. 100 bot world'deyken ağ döngüsünün
+CPU'su değişmedi: bu makinede eski loop 11.3 %, yeni loop **5.0 %** (bir çekirdeğin), p99 komut
+gecikmesi 3.1 ms.
+
+**Bulunan hata:** yürüme adımları başta (Mori gibi) unreliable gönderiliyordu. `--selftest`'teki sahte
+sunucu her state paketinde pozisyon farkını kontrol ediyor ve 2–3 tile'lık **ışınlanmalar** yakaladı:
+ENet'in throttle'ı unreliable paketleri düşürebiliyor, kaybolan adım sunucuda ışınlanma gibi görünüyor.
+Adımlar artık reliable; 6 koşuda 0 ışınlanma, 0 menzil (5x5) ihlali.
+
 ### Lua API (tek script, world içindeki bot)
 
 | İşlem | Maliyet |

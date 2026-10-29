@@ -2,14 +2,18 @@
 #include "../Core/Crypto.hpp"
 #include "../Core/Log.hpp"
 #include "../Core/Text.hpp"
+#include "../Game/Items.hpp"
 #include "../Game/Login.hpp"
 #include "../Net/Socks5Udp.hpp"
 
 #include "ENET/enet.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <format>
+#include <random>
+#include <unordered_map>
 
 using namespace Protocol;
 using namespace std::chrono_literals;
@@ -28,6 +32,25 @@ namespace {
 
     constexpr uint16_t ITEM_FIST = 18;
     constexpr uint16_t ITEM_WRENCH = 32;
+    constexpr uint16_t ITEM_GEMS = 112;
+
+    /* Walking, as AquaProxy's /path: a few tiles back to back, then a random
+       pause. Mori walks one tile per 500 ms and doesn't get banned. */
+    constexpr int STEP_MIN_MS = 80;
+    constexpr int STEP_MAX_MS = 200;
+    static_assert(STEP_MIN_MS <= STEP_MAX_MS, "STEP_MIN_MS must not be above STEP_MAX_MS");
+    constexpr int STEPS_PER_SEND = 2;
+    /* Route changes (door closed, pushed back, ...) before giving up. */
+    constexpr int MAX_REPLANS = 25;
+
+    constexpr size_t COLLECT_PER_CALL = 32;
+    constexpr auto COLLECT_RETRY = 1500ms;
+    constexpr auto AUTO_COLLECT_EVERY = 500ms;
+
+    int RandomMs(int low, int high) {
+        static thread_local std::mt19937 rng{ std::random_device{}() };
+        return std::uniform_int_distribution<int>(low, high)(rng);
+    }
 
     std::atomic<bool> gLegacyWait{ false };
 
@@ -138,6 +161,23 @@ struct Bot::Impl {
     uint32_t lastPing = 0;
     Clock::time_point started = Clock::now();
 
+    struct Path {
+        bool running = false;
+        uint64_t request = 0;
+        Pathfinder::Point target;
+        std::vector<Pathfinder::Point> nodes;
+        size_t next = 0;
+        int replans = 0;
+        std::string world;
+        Clock::time_point nextStep{};
+    } path;
+    bool facingLeft = false;
+
+    bool autoCollect = false;
+    int collectRadius = Pathfinder::REACH;
+    Clock::time_point nextAutoCollect{};
+    std::unordered_map<uint32_t, Clock::time_point> collectAsked; /* object uid -> retry after */
+
     explicit Impl(const std::optional<Net::Socks5Config>& proxy) : http(proxy) {}
 };
 
@@ -147,6 +187,7 @@ Bot::Bot(int id, Config::BotEntry entry, const Config::Common& settings)
     state_.growId = entry_.growId;
     state_.name = entry_.growId;
     state_.proxy = entry_.proxy ? entry_.proxy->ToString() : std::string();
+    world_.tag = tag_;
 
     Net::Startup();
     const SOCKET wake = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -231,8 +272,13 @@ std::pair<float, float> Bot::Position() const {
 }
 
 std::pair<int, int> Bot::Tile() const {
+    const Pathfinder::Point tile = CurrentTile();
+    return { tile.x, tile.y };
+}
+
+Pathfinder::Point Bot::CurrentTile() const {
     std::lock_guard lock(mutex_);
-    return { static_cast<int>(state_.x / 32.0f), static_cast<int>(state_.y / 32.0f) };
+    return Pathfinder::TileOf(state_.x, state_.y);
 }
 
 std::vector<InventoryItem> Bot::Inventory() const {
@@ -301,18 +347,35 @@ void Bot::Say(const std::string& text) {
     Post([this, text] { SendText("action|input\n|text|" + text + "\n"); });
 }
 
-void Bot::Walk(int tileX, int tileY) {
-    Post([this, tileX, tileY] {
-        const auto [x, y] = Position();
-        TankPacket tank;
-        tank.type = PACKET_STATE;
-        tank.x = static_cast<float>(tileX) * 32.0f;
-        tank.y = static_cast<float>(tileY) * 32.0f + 2.0f;
-        tank.punchX = tank.punchY = -1;
-        tank.flags = STATE_WALK | STATE_STANDING | (tank.x < x ? STATE_FACING_LEFT : 0u);
-        SendTank(tank, false);
-        Update([&](BotSnapshot& s) { s.x = tank.x; s.y = tank.y - 2.0f; });
-    });
+uint64_t Bot::Walk(int tileX, int tileY) {
+    const uint64_t request = ++pathRequests_;
+    Post([this, tileX, tileY, request] { StartPath(tileX, tileY, request); });
+    return request;
+}
+
+void Bot::StopWalk() {
+    Post([this] { if (impl_->path.running) EndPath(false, "stopped"); });
+}
+
+bool Bot::PathDone(uint64_t request, bool* ok, std::string* error) const {
+    std::lock_guard lock(mutex_);
+    if (state_.pathDone < request) return false;
+    /* A later walk ending first means this one was replaced. */
+    const bool mine = state_.pathDone == request;
+    if (ok) *ok = mine && state_.pathOk;
+    if (error) *error = mine ? state_.pathError : std::string("replaced by a newer walk");
+    return true;
+}
+
+Pathfinder::Result Bot::FindPath(int tileX, int tileY, std::vector<Pathfinder::Point>& path) const {
+    const Pathfinder::Point from = CurrentTile();
+    const auto userID = static_cast<uint32_t>(Read([](const BotSnapshot& s) { return s.userID; }));
+    std::lock_guard lock(worldMutex_);
+    return Pathfinder::Find(world_, from, { tileX, tileY }, userID, path);
+}
+
+bool Bot::InReach(int tileX, int tileY, bool placesBlock) const {
+    return Pathfinder::InReach(CurrentTile(), tileX, tileY, placesBlock);
 }
 
 void Bot::Drop(uint16_t itemID, int amount) {
@@ -346,26 +409,30 @@ void Bot::Wear(uint16_t itemID) {
     });
 }
 
-void Bot::Punch(int tileX, int tileY) {
-    Post([this, tileX, tileY] { SendTileAction(tileX, tileY, ITEM_FIST, STATE_PUNCH); });
+bool Bot::Punch(int tileX, int tileY) {
+    Post([this, tileX, tileY] { if (CheckReach("punch", tileX, tileY, false)) SendTileAction(tileX, tileY, ITEM_FIST, STATE_PUNCH); });
+    return InReach(tileX, tileY);
 }
 
-void Bot::Place(int tileX, int tileY, uint16_t itemID) {
+bool Bot::Place(int tileX, int tileY, uint16_t itemID) {
     Post([this, tileX, tileY, itemID] {
         if (!HasItem(itemID)) {
             Log::Warn(tag_, "place: no item {} in the inventory", itemID);
             return;
         }
-        SendTileAction(tileX, tileY, itemID, STATE_PLACE);
+        if (CheckReach("place", tileX, tileY, !ItemDB::IsBackground(itemID))) SendTileAction(tileX, tileY, itemID, STATE_PLACE);
     });
+    return HasItem(itemID) && InReach(tileX, tileY, !ItemDB::IsBackground(itemID));
 }
 
-void Bot::Wrench(int tileX, int tileY) {
-    Post([this, tileX, tileY] { SendTileAction(tileX, tileY, ITEM_WRENCH, STATE_PUNCH); });
+bool Bot::Wrench(int tileX, int tileY) {
+    Post([this, tileX, tileY] { if (CheckReach("wrench", tileX, tileY, false)) SendTileAction(tileX, tileY, ITEM_WRENCH, STATE_PUNCH); });
+    return InReach(tileX, tileY);
 }
 
-void Bot::Activate(int tileX, int tileY) {
+bool Bot::Activate(int tileX, int tileY) {
     Post([this, tileX, tileY] {
+        if (!CheckReach("enter", tileX, tileY, false)) return;
         const auto [x, y] = Position();
         TankPacket tank;
         tank.type = PACKET_TILE_ACTIVATE_REQUEST;
@@ -374,6 +441,23 @@ void Bot::Activate(int tileX, int tileY) {
         tank.punchX = tileX;
         tank.punchY = tileY;
         SendTank(tank, true);
+    });
+    return InReach(tileX, tileY);
+}
+
+int Bot::Collect(int radius) {
+    radius = std::clamp(radius, 0, Pathfinder::REACH);
+    Post([this, radius] { CollectNear(radius, false); });
+    return static_cast<int>(CollectTargets(radius).size());
+}
+
+void Bot::SetAutoCollect(bool enabled, int radius) {
+    radius = std::clamp(radius, 0, Pathfinder::REACH);
+    Update([&](BotSnapshot& s) { s.autoCollect = enabled; s.collectRadius = radius; });
+    Post([this, enabled, radius] {
+        impl_->autoCollect = enabled;
+        impl_->collectRadius = radius;
+        impl_->nextAutoCollect = Clock::now();
     });
 }
 
@@ -389,7 +473,21 @@ void Bot::DialogReturn(const std::string& dialog, const std::vector<std::pair<st
 
 void Bot::SendRawText(const std::string& text) { Post([this, text] { SendText(text); }); }
 void Bot::SendRawGameMessage(const std::string& text) { Post([this, text] { SendGameMessage(text); }); }
-void Bot::SendRawTank(const TankPacket& tank, bool reliable) { Post([this, tank, reliable] { SendTank(tank, reliable); }); }
+void Bot::SendRawTank(const TankPacket& tank, bool reliable) {
+    Post([this, tank, reliable] {
+        /* Raw packets get the same 5x5 reach guard as the built-in actions. */
+        const bool tileAction = tank.type == PACKET_TILE_CHANGE_REQUEST || tank.type == PACKET_TILE_ACTIVATE_REQUEST ||
+            (tank.type == PACKET_STATE && (tank.flags & (STATE_PUNCH | STATE_PLACE)) != 0);
+        if (tileAction) {
+            const bool placesBlock = tank.type == PACKET_TILE_CHANGE_REQUEST && tank.value != ITEM_FIST && tank.value != ITEM_WRENCH &&
+                !ItemDB::IsBackground(tank.value);
+            if (!CheckReach("raw packet", tank.punchX, tank.punchY, placesBlock)) return;
+        }
+        /* The server now has us where the packet says. */
+        if (tank.type == PACKET_STATE) Update([&](BotSnapshot& s) { s.x = tank.x; s.y = tank.y; });
+        SendTank(tank, reliable);
+    });
+}
 
 void Bot::SetStatus(BotStatus status, std::string text) {
     bool changed = false;
@@ -583,6 +681,7 @@ bool Bot::OpenConnection(const std::string& ip, uint16_t port) {
 
 void Bot::CloseConnection() {
     Impl& d = *impl_;
+    if (d.path.running) EndPath(false, "disconnected");
     if (d.peer && d.connected) enet_peer_disconnect_now(d.peer, 0);
     if (d.host) enet_host_destroy(d.host);
     d.host = nullptr;
@@ -593,6 +692,8 @@ void Bot::CloseConnection() {
     d.joinAt.reset();
     d.joinDeadline.reset();
     d.joining.clear();
+    d.collectAsked.clear();
+    EditWorld([](WorldState& world) { world.Clear(); });
     Update([](BotSnapshot& s) {
         s.world.clear();
         s.worldWidth = s.worldHeight = 0;
@@ -701,7 +802,12 @@ void Bot::Service() {
     }
     if (d.relay) d.relay->Pump();
 
-    Wait(CONNECTED_WAIT_MS);
+    int waitMs = CONNECTED_WAIT_MS;
+    if (d.path.running) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(d.path.nextStep - Clock::now()).count();
+        waitMs = static_cast<int>(std::clamp<long long>(left, 0, CONNECTED_WAIT_MS));
+    }
+    Wait(waitMs);
 }
 
 void Bot::RunCommands() {
@@ -732,6 +838,11 @@ void Bot::RunTimers() {
         d.joinDeadline.reset();
         Log::Warn(tag_, "no answer to joining {} -- asking again", d.joining);
         RequestJoin(d.joining, d.joiningDoor);
+    }
+    if (d.path.running && now >= d.path.nextStep) PathStep();
+    if (d.autoCollect && d.inWorld && now >= d.nextAutoCollect) {
+        d.nextAutoCollect = now + AUTO_COLLECT_EVERY;
+        CollectNear(d.collectRadius, true);
     }
 }
 
@@ -938,6 +1049,43 @@ void Bot::OnGamePacket(std::span<const uint8_t> data) {
             OnMapData(ExtendedOf(data));
             break;
 
+        case PACKET_TILE_CHANGE_REQUEST:
+            OnTileChange(*tank);
+            break;
+
+        case PACKET_SEND_TILE_UPDATE_DATA:
+            OnTileUpdate(*tank, ExtendedOf(data));
+            break;
+
+        case PACKET_SEND_TILE_UPDATE_DATA_MULTIPLE: {
+            const auto extended = ExtendedOf(data);
+            EditWorld([&](WorldState& world) { world.UpdateTiles(extended); });
+            break;
+        }
+
+        case PACKET_SEND_TILE_TREE_STATE: {
+            /* A harvested tree is gone. */
+            int64_t bg = -1;
+            EditWorld([&](WorldState& world) {
+                if (WorldTile* tile = world.Tile(tank->punchX, tank->punchY)) {
+                    tile->ClearForeground();
+                    bg = tile->bg;
+                }
+            });
+            if (bg >= 0 && Events::Wanted("tile_change")) Emit("tile_change", { int64_t(tank->punchX), int64_t(tank->punchY), int64_t(0), bg });
+            break;
+        }
+
+        case PACKET_SEND_LOCK:
+            EditWorld([&](WorldState& world) {
+                if (WorldTile* tile = world.Tile(tank->punchX, tank->punchY)) tile->fg = static_cast<uint16_t>(tank->value);
+            });
+            break;
+
+        case PACKET_ITEM_CHANGE_OBJECT:
+            OnItemChangeObject(*tank);
+            break;
+
         case PACKET_STATE: {
             Update([&](BotSnapshot& s) {
                 if (tank->netID == s.netID) {
@@ -995,15 +1143,23 @@ void Bot::OnInventoryState(std::span<const uint8_t> extended) {
 
 void Bot::OnMapData(std::span<const uint8_t> extended) {
     Impl& d = *impl_;
-    uint16_t nameLength = 0;
-    uint32_t width = 0, height = 0;
+    if (d.path.running) EndPath(false, "entered a new world");
+    d.collectAsked.clear();
+
+    bool complete = false;
     std::string name;
-    if (ReadAt(extended, 6, nameLength) && extended.size() >= 8u + nameLength) {
-        name.assign(reinterpret_cast<const char*>(extended.data() + 8), nameLength);
-        ReadAt(extended, 8u + nameLength, width);
-        ReadAt(extended, 12u + nameLength, height);
-    }
+    uint32_t width = 0, height = 0;
+    size_t objects = 0;
+    EditWorld([&](WorldState& w) {
+        complete = w.Parse(extended);
+        name = w.name;
+        width = w.width;
+        height = w.height;
+        objects = w.objects.size();
+    });
     const std::string world = Text::Upper(name);
+    if (complete) Log::Debug(tag_, "map {}: {} x {}, {} dropped objects", world, width, height, objects);
+    else Log::Warn(tag_, "map of {} only partly understood -- walking and tile data may be limited", world);
 
     d.inWorld = true;
     d.joinDeadline.reset();
@@ -1016,7 +1172,7 @@ void Bot::OnMapData(std::span<const uint8_t> extended) {
         s.status = BotStatus::InWorld;
         s.statusText.clear();
     });
-    Log::Info(tag_, "entered {} ({} x {})", world, width, height);
+    Log::Info(tag_, "entered {} ({} x {}, {} dropped items)", world, width, height, objects);
     if (Events::Wanted("status")) Emit("status", { std::string(StatusKey(BotStatus::InWorld)), std::string() });
     if (Events::Wanted("world_enter")) Emit("world_enter", { world, int64_t(width), int64_t(height) });
 
@@ -1031,8 +1187,11 @@ void Bot::OnMapData(std::span<const uint8_t> extended) {
 void Bot::OnWorldMenu() {
     Impl& d = *impl_;
     const bool wasInWorld = d.inWorld;
+    if (d.path.running) EndPath(false, "left the world");
     d.inWorld = false;
     d.joinDeadline.reset();
+    d.collectAsked.clear();
+    EditWorld([](WorldState& world) { world.Clear(); });
     std::string left;
     Update([&](BotSnapshot& s) {
         left = std::move(s.world);
@@ -1221,4 +1380,344 @@ void Bot::OnCallFunction(std::span<const uint8_t> extended) {
         if (Events::Wanted("dialog")) Emit("dialog", { std::string(list[1].String()) });
         return;
     }
+}
+
+/* ---- reach guard ---------------------------------------------------------
+   @important: the trick AquaProxy blocks. The game client only ever punches /
+   places / wrenches inside the 5x5 square around the player; with mstate /
+   smstate it can be made to reach further, and the server flags those packets
+   and bans. A headless bot can send anything, so it checks every tile action
+   against where the server has it and drops what a normal client couldn't
+   send. */
+bool Bot::CheckReach(const char* what, int tileX, int tileY, bool placesBlock) {
+    const Pathfinder::Point here = CurrentTile();
+    if (Pathfinder::InReach(here, tileX, tileY, placesBlock)) return true;
+    if (tileX == here.x && tileY == here.y) Log::Warn(tag_, "{} at ({}, {}) dropped: a block can't be placed on the tile the bot stands on", what, tileX, tileY);
+    else Log::Warn(tag_, "{} at ({}, {}) dropped: out of reach from ({}, {}), the game only allows {} tiles -- walk closer first",
+        what, tileX, tileY, here.x, here.y, Pathfinder::REACH);
+    return false;
+}
+
+/* ---- pathfinding (AquaProxy's /path) --------------------------------------- */
+void Bot::StartPath(int tileX, int tileY, uint64_t request) {
+    Impl& d = *impl_;
+    if (d.path.running) EndPath(false, "replaced by a new walk");
+
+    const Pathfinder::Point from = CurrentTile();
+    const Pathfinder::Point to{ tileX, tileY };
+    if (!d.connected || !d.inWorld) {
+        FinishPath(request, false, "not in a world");
+        return;
+    }
+
+    auto& path = d.path;
+    path = {};
+    path.request = request;
+    path.target = to;
+    const auto userID = static_cast<uint32_t>(Read([](const BotSnapshot& s) { return s.userID; }));
+    const auto result = Pathfinder::Find(world_, from, to, userID, path.nodes);
+    if (result != Pathfinder::Result::Found) {
+        path.nodes.clear();
+        FinishPath(request, false, Pathfinder::Describe(result));
+        return;
+    }
+    if (path.nodes.size() == 1) {
+        path.nodes.clear();
+        FinishPath(request, true, {});
+        return;
+    }
+
+    path.running = true;
+    path.next = 1;
+    path.world = world_.name;
+    path.nextStep = Clock::now();
+    Log::Debug(tag_, "walking to ({}, {}): {} tiles", tileX, tileY, path.nodes.size() - 1);
+    Update([&](BotSnapshot& s) {
+        s.walking = true;
+        s.pathTargetX = tileX;
+        s.pathTargetY = tileY;
+        s.pathLeft = path.nodes.size() - 1;
+    });
+    PathStep();
+}
+
+void Bot::EndPath(bool arrived, std::string reason) {
+    auto& path = impl_->path;
+    if (!path.running) return;
+    path.running = false;
+    path.nodes.clear();
+    FinishPath(path.request, arrived, std::move(reason));
+}
+
+void Bot::FinishPath(uint64_t request, bool arrived, std::string reason) {
+    const Pathfinder::Point here = CurrentTile();
+    Update([&](BotSnapshot& s) {
+        s.walking = false;
+        s.pathLeft = 0;
+        s.pathDone = std::max(s.pathDone, request);
+        s.pathOk = arrived;
+        s.pathError = reason;
+    });
+    if (arrived) {
+        Log::Debug(tag_, "arrived at ({}, {})", here.x, here.y);
+        if (Events::Wanted("arrived")) Emit("arrived", { int64_t(here.x), int64_t(here.y) });
+    }
+    else {
+        /* Replacing or stopping a walk is normal (WASD in the panel), not a problem. */
+        if (reason == "stopped" || reason.starts_with("replaced")) Log::Debug(tag_, "walk ended: {}", reason);
+        else Log::Warn(tag_, "walk cancelled: {}", reason);
+        if (Events::Wanted("path_fail")) Emit("path_fail", { reason, int64_t(here.x), int64_t(here.y) });
+    }
+}
+
+/* Any tile of the rest of the route that is no longer open (a door was
+   closed, a block was placed, access was removed, ...). */
+bool Bot::RouteBlocked() const {
+    const auto& path = impl_->path;
+    const auto userID = static_cast<uint32_t>(Read([](const BotSnapshot& s) { return s.userID; }));
+    for (size_t i = std::max<size_t>(path.next, 1); i < path.nodes.size(); ++i) {
+        const auto from = path.nodes[i - 1], to = path.nodes[i];
+        if (Pathfinder::EnterCost(world_, to.x, to.y, to.x - from.x, to.y - from.y, userID) < 0) return true;
+    }
+    return false;
+}
+
+void Bot::PathStep() {
+    Impl& d = *impl_;
+    auto& path = d.path;
+    if (!path.running) return;
+    if (!d.connected || !d.inWorld || world_.name != path.world) {
+        EndPath(false, "left the world");
+        return;
+    }
+
+    const Pathfinder::Point here = CurrentTile();
+    if (here == path.target) {
+        EndPath(true, {});
+        return;
+    }
+
+    /* Off the route (respawned, sent somewhere by the server, a raw packet)
+       or the route closed in front of us: plan again from where we really are. */
+    const bool offRoute = path.next == 0 || path.next >= path.nodes.size() || path.nodes[path.next - 1] != here;
+    if (offRoute || RouteBlocked()) {
+        if (++path.replans > MAX_REPLANS) {
+            EndPath(false, "the route kept changing, gave up");
+            return;
+        }
+        const auto userID = static_cast<uint32_t>(Read([](const BotSnapshot& s) { return s.userID; }));
+        const auto result = Pathfinder::Find(world_, here, path.target, userID, path.nodes);
+        if (result != Pathfinder::Result::Found) {
+            EndPath(false, Pathfinder::Describe(result));
+            return;
+        }
+        Log::Debug(tag_, "re-planned from ({}, {}): {} tiles", here.x, here.y, path.nodes.size());
+        path.next = 1;
+    }
+
+    /* A few tiles back to back, then a random pause. */
+    Pathfinder::Point from = here;
+    for (int i = 0; i < STEPS_PER_SEND && path.next < path.nodes.size(); ++i) {
+        const Pathfinder::Point step = path.nodes[path.next++];
+        if (step.x != from.x) d.facingLeft = step.x < from.x;
+        WalkTo(step, d.facingLeft);
+        from = step;
+    }
+    const size_t left = path.nodes.size() - path.next;
+    Update([&](BotSnapshot& s) { s.pathLeft = left; });
+    if (d.autoCollect) CollectNear(d.collectRadius, true);
+
+    if (from == path.target) {
+        EndPath(true, {});
+        return;
+    }
+    path.nextStep = Clock::now() + std::chrono::milliseconds(RandomMs(STEP_MIN_MS, STEP_MAX_MS));
+}
+
+/* One tile, like Mori's walk(): WALK | STANDING (| FACING_LEFT),
+   x = tile * 32, y = tile * 32 + 2. Reliable, unlike Mori: ENet's throttle
+   drops unreliable packets, and a lost step reads as a 2-3 tile jump on the
+   server (the --selftest fake server caught exactly that). */
+void Bot::WalkTo(Pathfinder::Point tile, bool facingLeft) {
+    TankPacket state;
+    state.type = PACKET_STATE;
+    state.flags = STATE_WALK | STATE_STANDING | (facingLeft ? STATE_FACING_LEFT : 0u);
+    state.x = Pathfinder::PixelX(tile.x);
+    state.y = Pathfinder::PixelY(tile.y);
+    state.punchX = -1;
+    state.punchY = -1;
+    SendTank(state, true);
+    Update([&](BotSnapshot& s) {
+        s.x = state.x;
+        s.y = state.y;
+    });
+}
+
+/* ---- dropped items ------------------------------------------------------- */
+std::vector<WorldObject> Bot::CollectTargets(int radius) const {
+    const Pathfinder::Point here = CurrentTile();
+    std::vector<WorldObject> nearby;
+    ReadWorld([&](const WorldState& world) {
+        for (const WorldObject& object : world.objects) {
+            if (object.id == 0 || object.count == 0) continue;
+            /* The item's centre (they are 16 px wide). */
+            const Pathfinder::Point tile = Pathfinder::TileOf(object.x - 2.0f, object.y - 7.0f);
+            if (std::abs(tile.x - here.x) <= radius && std::abs(tile.y - here.y) <= radius) nearby.push_back(object);
+        }
+        return 0;
+    });
+    if (nearby.empty()) return nearby;
+
+    /* Only what fits: gems always do, a full stack (200) or a full backpack don't. */
+    Read([&](const BotSnapshot& s) {
+        std::erase_if(nearby, [&](const WorldObject& object) {
+            if (object.id == ITEM_GEMS) return false;
+            const auto it = s.inventory.find(object.id);
+            if (it != s.inventory.end()) return it->second.amount >= 200;
+            return s.inventorySize > 0 && s.inventory.size() >= s.inventorySize;
+        });
+        return 0;
+    });
+    return nearby;
+}
+
+void Bot::CollectNear(int radius, bool quiet) {
+    Impl& d = *impl_;
+    if (!d.connected || !d.inWorld) return;
+    const auto now = Clock::now();
+    size_t sent = 0;
+    for (const WorldObject& object : CollectTargets(radius)) {
+        if (sent >= COLLECT_PER_CALL) break;
+        if (const auto it = d.collectAsked.find(object.uid); it != d.collectAsked.end() && now < it->second) continue;
+        TankPacket tank;
+        tank.type = PACKET_ITEM_ACTIVATE_OBJECT_REQUEST;
+        tank.x = object.x;
+        tank.y = object.y;
+        tank.value = static_cast<int32_t>(object.uid);
+        SendTank(tank, true);
+        d.collectAsked[object.uid] = now + COLLECT_RETRY;
+        ++sent;
+    }
+    if (d.collectAsked.size() > 512) std::erase_if(d.collectAsked, [&](const auto& entry) { return entry.second <= now; });
+    if (sent && !quiet) Log::Debug(tag_, "collecting {} dropped item(s)", sent);
+}
+
+/* ---- tile and object updates ---------------------------------------------- */
+void Bot::OnTileChange(const TankPacket& tank) {
+    /* The server's echo of a punch / place: what actually happened to the tile. */
+    const auto value = static_cast<uint16_t>(tank.value);
+    if (value == ITEM_WRENCH) return;
+    uint16_t fg = 0, bg = 0;
+    bool known = false;
+    EditWorld([&](WorldState& world) {
+        WorldTile* tile = world.Tile(tank.punchX, tank.punchY);
+        if (!tile) return;
+        if (value == ITEM_FIST) {
+            if (tile->fg != 0) tile->ClearForeground();
+            else tile->bg = 0;
+        }
+        else if (ItemDB::IsBackground(value)) tile->bg = value;
+        else {
+            tile->ClearForeground();
+            tile->fg = value;
+        }
+        world.TileChanged(static_cast<uint32_t>(tank.punchX), static_cast<uint32_t>(tank.punchY));
+        fg = tile->fg;
+        bg = tile->bg;
+        known = true;
+    });
+    if (known && Events::Wanted("tile_change")) Emit("tile_change", { int64_t(tank.punchX), int64_t(tank.punchY), int64_t(fg), int64_t(bg) });
+
+    /* Our own place: the game takes the block out of the backpack itself. */
+    int32_t netID = 0;
+    Read([&](const BotSnapshot& s) { netID = s.netID; return 0; });
+    if (tank.netID != netID || netID == 0 || value == ITEM_FIST || value == 0) return;
+    int amount = -1;
+    Update([&](BotSnapshot& s) {
+        const auto it = s.inventory.find(value);
+        if (it == s.inventory.end()) return;
+        amount = it->second.amount > 0 ? it->second.amount - 1 : 0;
+        it->second.amount = static_cast<uint8_t>(amount);
+        if (amount == 0) s.inventory.erase(it);
+    });
+    if (amount >= 0 && Events::Wanted("item")) Emit("item", { int64_t(value), int64_t(-1), int64_t(amount) });
+}
+
+void Bot::OnTileUpdate(const TankPacket& tank, std::span<const uint8_t> extended) {
+    uint16_t fg = 0, bg = 0;
+    bool ok = false;
+    EditWorld([&](WorldState& world) {
+        ok = tank.punchX >= 0 && tank.punchY >= 0 &&
+            world.UpdateTile(static_cast<uint32_t>(tank.punchX), static_cast<uint32_t>(tank.punchY), extended);
+        if (ok) {
+            const WorldTile* tile = world.Tile(tank.punchX, tank.punchY);
+            fg = tile->fg;
+            bg = tile->bg;
+        }
+    });
+    if (!ok) Log::Debug(tag_, "tile update failed at ({}, {})", tank.punchX, tank.punchY);
+    else if (Events::Wanted("tile_change")) Emit("tile_change", { int64_t(tank.punchX), int64_t(tank.punchY), int64_t(fg), int64_t(bg) });
+}
+
+void Bot::OnItemChangeObject(const TankPacket& tank) {
+    /* netID -1: new drop, -3: stack count changed, > 0: picked up by that
+       player (value = object uid). */
+    if (!impl_->inWorld) return;
+    if (tank.netID == -1) {
+        WorldObject object;
+        object.id = static_cast<uint16_t>(tank.value);
+        object.x = std::ceil(tank.x);
+        object.y = std::ceil(tank.y);
+        object.count = static_cast<uint8_t>(tank.floatValue);
+        object.flags = tank.objectType;
+        EditWorld([&](WorldState& world) {
+            object.uid = world.nextObjectUID++;
+            world.objects.push_back(object);
+        });
+        if (Events::Wanted("object_drop"))
+            Emit("object_drop", { int64_t(object.uid), int64_t(object.id), int64_t(object.count), double(object.x), double(object.y) });
+        if (impl_->autoCollect) CollectNear(impl_->collectRadius, true);
+        return;
+    }
+    if (tank.netID == -3) {
+        EditWorld([&](WorldState& world) {
+            const auto it = std::ranges::find_if(world.objects, [&](const WorldObject& o) {
+                return o.id == static_cast<uint16_t>(tank.value) && o.x == std::ceil(tank.x) && o.y == std::ceil(tank.y);
+            });
+            if (it != world.objects.end()) it->count = static_cast<uint8_t>(tank.floatValue);
+        });
+        return;
+    }
+    if (tank.netID <= 0) return;
+
+    std::optional<WorldObject> taken;
+    EditWorld([&](WorldState& world) {
+        const auto it = std::ranges::find_if(world.objects, [&](const WorldObject& o) { return o.uid == static_cast<uint32_t>(tank.value); });
+        if (it == world.objects.end()) return;
+        taken = *it;
+        world.objects.erase(it);
+    });
+    impl_->collectAsked.erase(static_cast<uint32_t>(tank.value));
+    if (!taken) return;
+
+    int32_t netID = 0;
+    Read([&](const BotSnapshot& s) { netID = s.netID; return 0; });
+    if (tank.netID != netID) {
+        if (Events::Wanted("object_take")) Emit("object_take", { int64_t(tank.netID), int64_t(taken->id), int64_t(taken->count) });
+        return;
+    }
+
+    /* Ours: the game adds it to the backpack itself (gems come with OnSetBux). */
+    int amount = 0;
+    if (taken->id != ITEM_GEMS) {
+        Update([&](BotSnapshot& s) {
+            auto& item = s.inventory[taken->id];
+            item.id = taken->id;
+            item.amount = static_cast<uint8_t>(std::min(200, item.amount + taken->count));
+            amount = item.amount;
+        });
+        if (Events::Wanted("item")) Emit("item", { int64_t(taken->id), int64_t(taken->count), int64_t(amount) });
+    }
+    Log::Debug(tag_, "collected {}x {}", taken->count, ItemDB::Name(taken->id));
+    if (Events::Wanted("collect")) Emit("collect", { int64_t(taken->id), int64_t(taken->count), int64_t(taken->uid) });
 }

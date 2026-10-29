@@ -14,8 +14,11 @@ local function deposit()
         warn("can't reach " .. DEPOSIT)
         return
     end
-    bot:walk(DROP_TILE.x, DROP_TILE.y)
-    sleep(500)
+    local ok, why = bot:walkAndWait(DROP_TILE.x, DROP_TILE.y)
+    if not ok then
+        warn("can't walk to the drop tile: " .. why)
+        return
+    end
     bot:drop(ITEM, count)
     log(string.format("%s dropped %d x %d in %s", bot.name, count, ITEM, DEPOSIT))
     sleep(1000)

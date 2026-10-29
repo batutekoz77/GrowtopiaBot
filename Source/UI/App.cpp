@@ -2,6 +2,7 @@
 #include "../Bot/BotManager.hpp"
 #include "../Core/Log.hpp"
 #include "../Core/Text.hpp"
+#include "../Game/Items.hpp"
 #include "../Script/ScriptEngine.hpp"
 
 #include "ImGui/imgui.h"
@@ -32,7 +33,7 @@ namespace {
 
     constexpr auto REFRESH_EVERY = 100ms;
     constexpr size_t LOG_LIMIT = 4000;
-    constexpr int REACH = 2;
+    constexpr int REACH = Pathfinder::REACH;
 
     const char* DEFAULT_SCRIPT =
         "-- GrowtopiaBot Lua script -- see Docs/LUA_API.md\n"
@@ -904,7 +905,7 @@ void App::DrawOverviewTab() {
     const auto stats = bot.Counters();
     const std::pair<const char*, std::string> tiles[] = {
         { "World", s.world.empty() ? "-" : std::format("{}  {}x{}", s.world, s.worldWidth, s.worldHeight) },
-        { "Tile", std::format("{}, {}", static_cast<int>(s.x / 32), static_cast<int>(s.y / 32)) },
+        { "Tile", std::format("{}, {}", Pathfinder::TileOf(s.x, s.y).x, Pathfinder::TileOf(s.x, s.y).y) },
         { "Gems", std::format("{}", s.gems) },
         { "Level", std::to_string(s.level) },
         { "Ping", s.pingMs ? std::format("{} ms", s.pingMs) : "-" },
@@ -981,7 +982,8 @@ void App::DrawWorldTab() {
     Bot& bot = *st.selected;
     const BotSnapshot& s = st.snapshot;
     const bool inWorld = s.status == BotStatus::InWorld && !s.world.empty();
-    const int botX = static_cast<int>(s.x / 32), botY = static_cast<int>(s.y / 32);
+    const Pathfinder::Point botTile = Pathfinder::TileOf(s.x, s.y);
+    const int botX = botTile.x, botY = botTile.y;
 
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##worldtab");
@@ -1026,9 +1028,27 @@ void App::DrawWorldTab() {
         std::array<std::vector<const PlayerInfo*>, (2 * REACH + 1) * (2 * REACH + 1)> here;
         if (inWorld) {
             for (const auto& [netID, p] : s.players) {
-                const int dx = static_cast<int>(p.x / 32) - botX, dy = static_cast<int>(p.y / 32) - botY;
+                const Pathfinder::Point tile = Pathfinder::TileOf(p.x, p.y);
+                const int dx = tile.x - botX, dy = tile.y - botY;
                 if (std::abs(dx) <= REACH && std::abs(dy) <= REACH) here[static_cast<size_t>((dy + REACH) * (2 * REACH + 1) + dx + REACH)].push_back(&p);
             }
+        }
+
+        struct CellTile { bool known = false; uint16_t fg = 0, bg = 0; bool walkable = false; };
+        std::array<CellTile, (2 * REACH + 1) * (2 * REACH + 1)> cells{};
+        if (inWorld) {
+            const auto userID = static_cast<uint32_t>(s.userID);
+            bot.ReadWorld([&](const WorldState& world) {
+                for (int dy = -REACH; dy <= REACH; ++dy) {
+                    for (int dx = -REACH; dx <= REACH; ++dx) {
+                        const WorldTile* t = world.Tile(botX + dx, botY + dy);
+                        if (!t) continue;
+                        cells[static_cast<size_t>((dy + REACH) * (2 * REACH + 1) + dx + REACH)] =
+                            { true, t->fg, t->bg, Pathfinder::EnterCost(world, botX + dx, botY + dy, 0, 0, userID) >= 0 };
+                    }
+                }
+                return 0;
+            });
         }
 
         const ToolInfo& tool = TOOLS[static_cast<size_t>(st.tool)];
@@ -1055,6 +1075,7 @@ void App::DrawWorldTab() {
                 const bool held = valid && ImGui::IsItemActive();
                 ImGui::PopID();
                 const auto& players = here[static_cast<size_t>((dy + REACH) * (2 * REACH + 1) + dx + REACH)];
+                const CellTile& cellTile = cells[static_cast<size_t>((dy + REACH) * (2 * REACH + 1) + dx + REACH)];
 
                 if (clicked) {
                     switch (st.tool) {
@@ -1071,6 +1092,11 @@ void App::DrawWorldTab() {
                     ImGui::SameLine();
                     ImGui::Text("tile %d, %d", tx, ty);
                     ImGui::TextDisabled("offset %+d, %+d from the bot", dx, dy);
+                    if (cellTile.known) {
+                        ImGui::Text("fg: %s", cellTile.fg ? std::format("{} (#{})", ItemDB::Name(cellTile.fg), cellTile.fg).c_str() : "-");
+                        ImGui::Text("bg: %s", cellTile.bg ? std::format("{} (#{})", ItemDB::Name(cellTile.bg), cellTile.bg).c_str() : "-");
+                        ImGui::TextColored(cellTile.walkable ? Theme::Teal : Theme::Orange, "%s", cellTile.walkable ? "walkable" : "solid / no access");
+                    }
                     for (const PlayerInfo* p : players) ImGui::TextColored(p->moderator ? Theme::Red : Theme::Teal, "%s%s", p->name.c_str(), p->moderator ? "  [MOD]" : "");
                     ImGui::EndTooltip();
                 }
@@ -1078,6 +1104,7 @@ void App::DrawWorldTab() {
                 const float rounding = S(12);
                 ImVec4 fill = valid ? Theme::Raised : Alpha(Theme::Surface, 0.6f);
                 if (center && inWorld) fill = Alpha(Theme::Aqua, 0.20f);
+                else if (valid && cellTile.known && !cellTile.walkable) fill = Alpha(Theme::Orange, 0.10f);
                 dl->AddRectFilled(min, max, Col(fill), rounding);
                 if (hovered) dl->AddRectFilled(min, max, Col(tool.color, held ? 0.34f : 0.20f), rounding);
                 const ImVec4 border = hovered ? tool.color : center && inWorld ? Theme::Aqua : Theme::Line;
@@ -1102,6 +1129,13 @@ void App::DrawWorldTab() {
                 }
                 const std::string coords = std::format("{},{}", tx, ty);
                 dl->AddText(nullptr, fontSize * 0.72f, { min.x + S(7), min.y + S(5) }, Col(Theme::Faint), coords.c_str());
+                if (!center && !hovered && cellTile.known && (cellTile.fg || cellTile.bg)) {
+                    const float nameSize = fontSize * 0.72f;
+                    dl->PushClipRect({ min.x + S(4), min.y }, { max.x - S(4), max.y }, true);
+                    if (cellTile.fg) dl->AddText(nullptr, nameSize, { min.x + S(7), max.y - S(6) - nameSize * 2 }, Col(Theme::Text, 0.9f), ItemDB::Name(cellTile.fg).c_str());
+                    if (cellTile.bg) dl->AddText(nullptr, nameSize, { min.x + S(7), max.y - S(5) - nameSize }, Col(Theme::Muted, 0.8f), ItemDB::Name(cellTile.bg).c_str());
+                    dl->PopClipRect();
+                }
                 for (size_t k = 0; k < std::min<size_t>(players.size(), 4); ++k) {
                     dl->AddCircleFilled({ max.x - S(10) - static_cast<float>(k) * S(10), max.y - S(10) }, S(3.5f), Col(players[k]->moderator ? Theme::Red : Theme::Teal));
                 }
@@ -1147,6 +1181,56 @@ void App::DrawWorldTab() {
         ImGui::SameLine();
         if (PrimaryButton("Go", ImVec2(S(70), 0))) bot.Walk(st.walkX, st.walkY);
         if (ImGui::Button("Here", ImVec2(-FLT_MIN, 0))) { st.walkX = botX; st.walkY = botY; }
+        if (s.walking) {
+            Caption(std::format("Walking to {}, {}  ·  {} tile(s) left", s.pathTargetX, s.pathTargetY, s.pathLeft).c_str());
+            if (DangerButton("Stop walking", ImVec2(-FLT_MIN, 0))) bot.StopWalk();
+        }
+        else if (s.pathDone > 0 && !s.pathOk) Caption(std::format("Last walk: {}", s.pathError).c_str());
+        else Caption("Walks tile by tile around blocks, doors and locks.");
+    }
+    EndCard();
+
+    if (BeginCard("##drops", wide ? sideWidth : 0.0f)) {
+        struct Drop { uint32_t uid; uint16_t id; uint8_t count; int dx, dy; };
+        size_t total = 0;
+        std::vector<Drop> drops;
+        if (inWorld) {
+            bot.ReadWorld([&](const WorldState& world) {
+                total = world.objects.size();
+                drops.reserve(std::min<size_t>(total, 64));
+                for (const WorldObject& o : world.objects) {
+                    const Pathfinder::Point tile = Pathfinder::TileOf(o.x - 2.0f, o.y - 7.0f);
+                    drops.push_back({ o.uid, o.id, o.count, tile.x - botX, tile.y - botY });
+                }
+                return 0;
+            });
+        }
+        const auto distance = [](const Drop& d) { return std::max(std::abs(d.dx), std::abs(d.dy)); };
+        const size_t shown = std::min<size_t>(drops.size(), 6);
+        std::partial_sort(drops.begin(), drops.begin() + static_cast<std::ptrdiff_t>(shown), drops.end(),
+            [&](const Drop& a, const Drop& b) { return distance(a) < distance(b); });
+
+        CardTitle(st.bold, "Dropped items", std::format("{} in the world", total).c_str());
+        ImGui::BeginDisabled(!inWorld);
+        bool autoCollect = s.autoCollect;
+        if (ImGui::Checkbox("Auto collect", &autoCollect)) bot.SetAutoCollect(autoCollect);
+        ImGui::SameLine();
+        if (TintButton("Collect nearby", Theme::Aqua)) bot.Collect();
+        ImGui::EndDisabled();
+        for (size_t i = 0; i < shown; ++i) {
+            const Drop& d = drops[i];
+            ImGui::PushID(static_cast<int>(d.uid));
+            const bool inReach = distance(d) <= REACH;
+            ImGui::BeginDisabled(inReach || !inWorld);
+            if (ImGui::SmallButton("Walk")) bot.Walk(botX + d.dx, botY + d.dy);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextColored(inReach ? Theme::Teal : Theme::Text, "%s x%u", ItemDB::Name(d.id).c_str(), static_cast<unsigned>(d.count));
+            ImGui::SameLine();
+            ImGui::TextDisabled("%+d, %+d", d.dx, d.dy);
+            ImGui::PopID();
+        }
+        Caption(std::format("Collects within {} tiles (the game's own reach).", REACH).c_str());
     }
     EndCard();
 
@@ -1178,7 +1262,7 @@ void App::DrawInventoryTab() {
         ImGui::ProgressBar(used, ImVec2(-FLT_MIN, S(6)), "");
         ImGui::PopStyleColor();
         ImGui::SetNextItemWidth(S(220));
-        ImGui::InputTextWithHint("##invfilter", "Search item id", &st.inventoryFilter);
+        ImGui::InputTextWithHint("##invfilter", "Search name or id", &st.inventoryFilter);
         ImGui::SameLine(0, S(18));
         Caption("Amount");
         ImGui::SameLine();
@@ -1197,20 +1281,25 @@ void App::DrawInventoryTab() {
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(S(12), S(8)));
     if (ImGui::BeginTable("##inventory", 4, flags, ImVec2(0, 0))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthFixed, S(120));
+        ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthFixed, S(240));
         ImGui::TableSetupColumn("Amount", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Flags", ImGuiTableColumnFlags_WidthFixed, S(80));
         ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, S(330));
         ImGui::TableHeadersRow();
         for (const auto& [id, item] : s.inventory) {
-            if (!st.inventoryFilter.empty() && !Text::Contains(std::to_string(id), st.inventoryFilter)) continue;
+            const std::string name = ItemDB::Name(id);
+            if (!st.inventoryFilter.empty() && !Text::Contains(std::to_string(id), st.inventoryFilter) && !Text::IContains(name, st.inventoryFilter)) continue;
             ImGui::TableNextRow();
             ImGui::PushID(id);
             ImGui::TableSetColumnIndex(0);
             ImGui::AlignTextToFramePadding();
             ImGui::PushFont(st.bold, 0.0f);
-            ImGui::Text("#%u", id);
+            ImGui::TextUnformatted(name.c_str());
             ImGui::PopFont();
+            if (!name.starts_with('#')) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("#%u", id);
+            }
             ImGui::TableSetColumnIndex(1);
             ImGui::AlignTextToFramePadding();
             const std::string count = std::to_string(item.amount);
@@ -1270,7 +1359,8 @@ void App::DrawPlayersTab() {
             ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%d", netID);
             ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%d", p.userID);
             ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(p.country.c_str());
-            ImGui::TableSetColumnIndex(4); ImGui::Text("%d, %d", static_cast<int>(p.x / 32), static_cast<int>(p.y / 32));
+            const Pathfinder::Point tile = Pathfinder::TileOf(p.x, p.y);
+            ImGui::TableSetColumnIndex(4); ImGui::Text("%d, %d", tile.x, tile.y);
         }
         ImGui::EndTable();
     }
@@ -1678,6 +1768,14 @@ void App::DrawSettingsTab() {
     if (BeginCard("##misc")) {
         CardTitle(st.bold, "Logging");
         ImGui::Checkbox("Debug logging", &s.debug);
+    }
+    EndCard();
+
+    if (BeginCard("##items")) {
+        CardTitle(st.bold, "Items (items.dat)", ItemDB::Ready() ? "loaded" : "not loaded");
+        ImGui::TextWrapped("%s", ItemDB::Status().c_str());
+        Caption("Read from items.dat next to GrowtopiaBot.exe, else from the game's cache folder.");
+        Caption("Without it item names are unknown and the pathfinder only walks through air.");
     }
     EndCard();
 

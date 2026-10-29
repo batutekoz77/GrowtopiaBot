@@ -124,7 +124,7 @@ Hepsi salt-okunur, her okuma güncel değeri verir: `bot.world`, `bot.gems`...
 | `worldWidth`, `worldHeight` | integer | World boyutu (tile). |
 | `targetWorld` | string | Kick / reconnect sonrası otomatik döneceği world. |
 | `x`, `y` | number | Pozisyon (piksel). |
-| `tileX`, `tileY` | integer | Pozisyon (tile = piksel / 32). |
+| `tileX`, `tileY` | integer | Pozisyon (tile; avatarın ortası, AquaProxy ile aynı hesap). |
 | `gems` | integer | Gem sayısı. |
 | `level` | integer | Seviye. |
 | `ping` | integer | ms. |
@@ -132,6 +132,8 @@ Hepsi salt-okunur, her okuma güncel değeri verir: `bot.world`, `bot.gems`...
 | `inventorySize` | integer | Envanter slot sayısı. |
 | `proxy` | string | `host:port` (şifre gösterilmez) veya `""`. |
 | `autoReconnect` | boolean | Kopunca otomatik bağlanır mı. |
+| `walking` | boolean | Şu an bir `walk` yürüyor mu. |
+| `autoCollect` | boolean | Yerdeki item'ları kendiliğinden topluyor mu. |
 
 `tostring(bot)` → `Bot(#1 GROWID)`. İki bot nesnesi `==` ile karşılaştırılabilir.
 
@@ -158,13 +160,21 @@ Metotlar `:` ile çağrılır: `bot:warp("START")`.
 | `bot:warpAndWait(world, [timeoutMs=30000], [kapıId])` | Warp atar ve girene kadar bekler → `true/false`. |
 | `bot:leave()` | World'den çıkar (world menüsüne). |
 | `bot:setTargetWorld(world)` | Kalacağı world; atılınca / yeniden bağlanınca oraya döner. `""` = kapalı. |
-| `bot:walk(tileX, tileY)` | O tile'a tek adım (`PACKET_STATE`). |
-| `bot:move(dx, [dy=0])` | Bulunduğu tile'a göre göreli adım. |
+| `bot:walk(tileX, tileY)` | O tile'a **yol bularak** yürür (A*), hemen döner. Yeni `walk` eskisinin yerini alır. |
+| `bot:walkAndWait(tileX, tileY, [timeoutMs=30000])` | Yürür ve varana kadar bekler → `true` / `false, sebep`. |
+| `bot:stopWalk()` | Yürümeyi durdurur. |
+| `bot:findPath(tileX, tileY)` | Yürümeden yolu hesaplar → `{ {x, y}, ... }` (iki uç dahil) / `nil, sebep`. |
+| `bot:move(dx, [dy=0])` | Bulunduğu tile'a göre göreli yürüme (`walk` ile aynı). |
 | `bot:respawn()` | Respawn. |
-| `bot:enter(tileX, tileY)` | O tile'daki kapıya / portala girer. |
+| `bot:enter(tileX, tileY)` | O tile'daki kapıya / portala girer (5x5 içindeyse) → `boolean`. |
 
-> `walk`/`move` yol bulma (pathfinding) yapmaz, tek adım atar. Uzak tile'lara adım adım ve
-> araya `sleep` koyarak git; sunucu çok hızlı/uzak adımları reddedebilir.
+> **Pathfinding (AquaProxy'nin `/path`'i):** A* world'ün gerçek tile verisiyle çalışır: katı bloklar,
+> kapalı kapılar, erişimimiz olmayan entrance'lar, VIP / friends entrance'ları, tek yönlü bloklar ve
+> platformlar dikkate alınır; ateş / diken gibi zararlı tile'lardan mümkünse kaçınılır. Bot her pakette
+> **bir tile** ilerler (iki adım arka arkaya, sonra 80–200 ms rastgele bekleme), adımlar reliable
+> gönderilir (kaybolan adım sunucuda ışınlanma gibi görünürdü). Yol kapanırsa (kapı kapandı, blok
+> koyuldu, sunucu botu başka yere koydu) bulunduğu yerden yeniden hesaplar (en fazla 25 kez).
+> `items.dat` yoksa her ön plan bloğu katı sayılır, yani sadece boşluktan yürünür.
 
 ### Konuşma ve diyaloglar
 
@@ -177,22 +187,59 @@ Metotlar `:` ile çağrılır: `bot:warp("START")`.
 
 | Metot | Dönüş | Açıklama |
 |---|---|---|
-| `bot:getInventory()` | dizi | `{ id, count, flags }` tabloları. |
+| `bot:getInventory()` | dizi | `{ id, name, count, flags }` tabloları. |
 | `bot:getItemCount(id)` | integer | O itemden kaç tane var. |
 | `bot:hasItem(id, [adet=1])` | boolean | |
 | `bot:drop(id, [adet])` | boolean | Drop atar. `adet` yoksa hepsi. Yeterli item yoksa `false`. |
 | `bot:trash(id, [adet])` | boolean | Çöpe atar. `adet` yoksa hepsi. |
 | `bot:wear(id)` / `bot:unwear(id)` / `bot:use(id)` | – | Giy / çıkar / kullan (aynı paket: item activate). |
 
-> Item **isimleri** yok, sadece **id**'ler (items.dat okunmuyor).
+> Item isimleri `items.dat`'tan gelir: önce `GrowtopiaBot.exe`'nin yanındaki `items.dat`, yoksa oyunun
+> önbelleği (`%LOCALAPPDATA%\Growtopia\cache\items.dat`). Yüklenmemişse isim yerine `"#id"` döner.
 
 ### World ile etkileşim
 
-| Metot | Açıklama |
-|---|---|
-| `bot:punch(tileX, tileY)` | Yumruk atar. |
-| `bot:place(tileX, tileY, itemId)` | Blok / tohum koyar (itemde yoksa yapmaz). |
-| `bot:wrench(tileX, tileY)` | Wrench kullanır. |
+| Metot | Dönüş | Açıklama |
+|---|---|---|
+| `bot:punch(tileX, tileY)` | boolean | Yumruk atar. |
+| `bot:place(tileX, tileY, itemId)` | boolean | Blok / tohum koyar (itemde yoksa yapmaz). |
+| `bot:wrench(tileX, tileY)` | boolean | Wrench kullanır. |
+| `bot:inReach(tileX, tileY)` | boolean | Tile botun 5x5 alanında mı. |
+
+> ⚠️ **5x5 kuralı (ban koruması):** oyun yumruk / koyma / wrench / kapıya girmeyi sadece oyuncunun
+> etrafındaki 5x5 kare içinde (her eksende en fazla 2 tile) yapar. mstate / smstate ile spawn olan
+> karakter daha uzağa vurabilir, ama sunucu bu paketleri işaretler ve **banlar**. AquaProxy bunu uzak
+> paketleri düşürerek engelliyor; bot da aynısını yapar: 5x5 dışındaki her tile işlemi (ham
+> `sendPacket` dahil) **gönderilmez**, Log'a uyarı yazılır. Blok botun kendi tile'ına koyulamaz
+> (background koyulabilir). Dönüş değeri çağrı anındaki bu kontroldür; uzaktaysan önce
+> `walkAndWait` ile yaklaş.
+
+### Tile verisi ve yerdeki item'lar
+
+| Metot | Dönüş | Açıklama |
+|---|---|---|
+| `bot:getTile(tileX, tileY)` | tablo / nil | Tek tile (world dışıysa `nil`). |
+| `bot:getTiles()` | dizi | World'deki bütün tile'lar (100x60 = 6000 tablo; sık çağırma). |
+| `bot:findTiles(itemId)` | dizi | Ön planında veya arka planında o item olan tile'lar: `{ {x, y}, ... }`. |
+| `bot:getObjects()` | dizi | Yerdeki (drop edilmiş) item'lar. |
+| `bot:collect([yarıçap=2])` | integer | Yarıçap (tile, en fazla 2) içindeki item'ları toplar; menzildekilerin sayısını döner. Envantere sığmayanları (200'lük yığın, dolu çanta) almaz. |
+| `bot:setAutoCollect(bool, [yarıçap=2])` | – | Yürürken, yeni drop düşünce ve 0.5 s'de bir kendiliğinden toplar. |
+
+Tile tablosu: `{ x, y, fg, bg, fgName, bgName, flags, extraKind, walkable }`; kapı / tabelada `label`,
+kilitte `owner` (userID), ağaçta `age` (saniye), `fruit` ve `ready` (büyüdü mü) de vardır.
+Obje tablosu: `{ uid, id, name, count, x, y, tileX, tileY }`.
+
+Tile'lar world girişindeki harita paketinden okunur ve sunucunun tile güncellemeleriyle (kırma,
+koyma, tile update, ağaç hasadı) güncel tutulur.
+
+### Item bilgisi (global)
+
+| Fonksiyon | Dönüş | Açıklama |
+|---|---|---|
+| `getItemName(id)` | string | `"Dirt"`, yüklenmediyse `"#2"`. |
+| `getItemId(isim)` | integer / nil | Büyük/küçük harf duyarsız: `getItemId("dirt seed")`. |
+| `getItemInfo(id \| isim)` | tablo / nil | `{ id, name, type, collision, category, rarity, hits, growTime, background, info }`. |
+| `itemsReady()` | boolean | `items.dat` yüklendi mi. |
 
 ### Oyuncular
 
@@ -270,6 +317,12 @@ local bot, world, w, h = wait("world_enter", 10000)
 | `packet` | `type, netID, value, x, y, punchX, punchY, flags` | Gelen her tank paketi. **Yoğun**: sadece gerekiyorsa dinle. |
 | `text` | `text` | Ham `GENERIC_TEXT` mesajı. |
 | `game_message` | `text` | Ham `GAME_MESSAGE` (`action|log` vb.). |
+| `arrived` | `tileX, tileY` | `walk` hedefe vardı. |
+| `path_fail` | `sebep, tileX, tileY` | `walk` bitti ama varamadı (yol yok, world değişti, durduruldu...). |
+| `tile_change` | `tileX, tileY, fg, bg` | Bir tile değişti (kırıldı, koyuldu, güncellendi). |
+| `object_drop` | `uid, itemId, adet, x, y` | Yere yeni bir item düştü. |
+| `object_take` | `netID, itemId, adet` | Başka bir oyuncu yerden item aldı. |
+| `collect` | `itemId, adet, uid` | Bot yerden item topladı. |
 | `*` | `olayAdı, değerler...` | Hepsi (yoğun). |
 
 Notlar:
@@ -363,12 +416,29 @@ local bot = getBot()
 while true do
     if bot.inWorld and bot:getItemCount(242) >= 50 then
         bot:warpAndWait("DEPOSIT")
-        bot:walk(10, 20) sleep(500)
-        bot:drop(242)              -- hepsini
+        if bot:walkAndWait(10, 20) then
+            bot:drop(242)          -- hepsini
+        end
         sleep(1000)
     end
     sleep(5000)
 end
+```
+
+### Yürü, kır, topla
+
+```lua
+local bot = getBot()
+local ok, why = bot:walkAndWait(30, 20)
+if not ok then error("varamadım: " .. why) end
+local tile = bot:getTile(31, 20)
+print(tile.fgName, tile.walkable)
+while bot:getTile(31, 20).fg ~= 0 do
+    bot:punch(31, 20)          -- 5x5 içinde
+    sleep(250)
+end
+sleep(500)
+print("topluyor:", bot:collect())
 ```
 
 ### Diyalog doldurma
@@ -397,7 +467,8 @@ Daha fazlası: `Docs/examples/` (`example_basic.lua`, `example_events.lua`,
 - Komut kuyruğa alma (`say`, `drop`...) ≈ 0.3 µs; bot thread'i anında uyanır (~0.3 ms).
 - **Oyunun kendisi** hızlı komutları sevmez: aynı anda çok sayıda warp/drop/say spam'i
   sunucudan kick/ban sebebi olabilir. Aralara `sleep` koy, girişleri `connectAll()` gibi aralıklı yap.
-- `walk`/`move` tek adım; pathfinding yok. Tile verisi (bloklar), yerdeki item'lar (collect) ve item
-  isimleri şu an okunmuyor.
+- Harita okuma ~70 µs, A* 7–50 µs (100x60 world, `--bench` bölüm 6); 100 bot world'deyken bile
+  CPU değişmez.
+- 5x5 dışına yumruk / koyma / wrench / kapı ve 2 tile'dan uzaktaki item'ı toplama **hiç gönderilmez**.
 - Script içinden `io`/`os` gibi standart kütüphaneler açık (dosya okuma/yazma yapılabilir) — sadece
   güvendiğin scriptleri çalıştır.

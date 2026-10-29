@@ -1,6 +1,7 @@
 #include "ScriptRuntime.hpp"
 #include "../Bot/BotManager.hpp"
 #include "../Core/Text.hpp"
+#include "../Game/Items.hpp"
 
 #include "Lua/lua.h"
 #include "Lua/lualib.h"
@@ -497,6 +498,7 @@ namespace {
     enum class Prop {
         Id, GrowId, Name, Status, StatusText, World, TargetWorld, X, Y, TileX, TileY, Gems, Level, Ping,
         NetId, UserId, Proxy, WorldWidth, WorldHeight, InventorySize, AutoReconnect, Running, Online, InWorld,
+        Walking, AutoCollect,
     };
 
     const std::unordered_map<std::string_view, Prop>& Props() {
@@ -509,6 +511,7 @@ namespace {
             { "worldWidth", Prop::WorldWidth }, { "worldHeight", Prop::WorldHeight },
             { "inventorySize", Prop::InventorySize }, { "autoReconnect", Prop::AutoReconnect },
             { "running", Prop::Running }, { "online", Prop::Online }, { "inWorld", Prop::InWorld },
+            { "walking", Prop::Walking }, { "autoCollect", Prop::AutoCollect },
         };
         return props;
     }
@@ -545,6 +548,8 @@ namespace {
             case Prop::Running: lua_pushboolean(L, bot.Running()); return;
             case Prop::Online: lua_pushboolean(L, IsOnline(bot.Status())); return;
             case Prop::InWorld: lua_pushboolean(L, bot.Status() == BotStatus::InWorld); return;
+            case Prop::Walking: lua_pushboolean(L, bot.Read([](const BotSnapshot& s) { return s.walking; })); return;
+            case Prop::AutoCollect: lua_pushboolean(L, bot.Read([](const BotSnapshot& s) { return s.autoCollect; })); return;
         }
         lua_pushnil(L);
     }
@@ -597,12 +602,14 @@ namespace {
     int M_warp(lua_State* L) { CheckBot(L).Warp(luaL_checkstring(L, 2), luaL_optstring(L, 3, "")); return 0; }
     int M_leave(lua_State* L) { CheckBot(L).LeaveWorld(); return 0; }
     int M_walk(lua_State* L) { CheckBot(L).Walk(CheckInt(L, 2), CheckInt(L, 3)); return 0; }
+    int M_stopWalk(lua_State* L) { CheckBot(L).StopWalk(); return 0; }
     int M_respawn(lua_State* L) { CheckBot(L).Respawn(); return 0; }
     int M_wear(lua_State* L) { CheckBot(L).Wear(CheckItem(L, 2)); return 0; }
-    int M_punch(lua_State* L) { CheckBot(L).Punch(CheckInt(L, 2), CheckInt(L, 3)); return 0; }
-    int M_place(lua_State* L) { CheckBot(L).Place(CheckInt(L, 2), CheckInt(L, 3), CheckItem(L, 4)); return 0; }
-    int M_wrench(lua_State* L) { CheckBot(L).Wrench(CheckInt(L, 2), CheckInt(L, 3)); return 0; }
-    int M_enter(lua_State* L) { CheckBot(L).Activate(CheckInt(L, 2), CheckInt(L, 3)); return 0; }
+    int M_punch(lua_State* L) { lua_pushboolean(L, CheckBot(L).Punch(CheckInt(L, 2), CheckInt(L, 3))); return 1; }
+    int M_place(lua_State* L) { lua_pushboolean(L, CheckBot(L).Place(CheckInt(L, 2), CheckInt(L, 3), CheckItem(L, 4))); return 1; }
+    int M_wrench(lua_State* L) { lua_pushboolean(L, CheckBot(L).Wrench(CheckInt(L, 2), CheckInt(L, 3))); return 1; }
+    int M_enter(lua_State* L) { lua_pushboolean(L, CheckBot(L).Activate(CheckInt(L, 2), CheckInt(L, 3))); return 1; }
+    int M_inReach(lua_State* L) { lua_pushboolean(L, CheckBot(L).InReach(CheckInt(L, 2), CheckInt(L, 3))); return 1; }
     int M_setTargetWorld(lua_State* L) { CheckBot(L).SetTargetWorld(luaL_optstring(L, 2, "")); return 0; }
     int M_setAutoReconnect(lua_State* L) { CheckBot(L).SetAutoReconnect(lua_toboolean(L, 2)); return 0; }
     int M_sendText(lua_State* L) { CheckBot(L).SendRawText(luaL_checkstring(L, 2)); return 0; }
@@ -727,8 +734,9 @@ namespace {
         lua_createtable(L, static_cast<int>(items.size()), 0);
         int i = 0;
         for (const auto& item : items) {
-            lua_createtable(L, 0, 3);
+            lua_createtable(L, 0, 4);
             lua_pushinteger(L, item.id); lua_setfield(L, -2, "id");
+            PushString(L, ItemDB::Name(item.id)); lua_setfield(L, -2, "name");
             lua_pushinteger(L, item.amount); lua_setfield(L, -2, "count");
             lua_pushinteger(L, item.flags); lua_setfield(L, -2, "flags");
             lua_rawseti(L, -2, ++i);
@@ -751,8 +759,9 @@ namespace {
         PushString(L, p.country); lua_setfield(L, -2, "country");
         lua_pushnumber(L, p.x); lua_setfield(L, -2, "x");
         lua_pushnumber(L, p.y); lua_setfield(L, -2, "y");
-        lua_pushinteger(L, static_cast<lua_Integer>(p.x / 32.0f)); lua_setfield(L, -2, "tileX");
-        lua_pushinteger(L, static_cast<lua_Integer>(p.y / 32.0f)); lua_setfield(L, -2, "tileY");
+        const auto tile = Pathfinder::TileOf(p.x, p.y);
+        lua_pushinteger(L, tile.x); lua_setfield(L, -2, "tileX");
+        lua_pushinteger(L, tile.y); lua_setfield(L, -2, "tileY");
         lua_pushboolean(L, p.moderator); lua_setfield(L, -2, "moderator");
     }
 
@@ -828,6 +837,181 @@ namespace {
         return 1;
     }
 
+    int M_walkAndWait(lua_State* L) {
+        Bot& bot = CheckBot(L);
+        const uint64_t request = bot.Walk(CheckInt(L, 2), CheckInt(L, 3));
+        const lua_Integer timeout = luaL_optinteger(L, 4, DEFAULT_WAIT_MS);
+        bool ok = false;
+        std::string error;
+        if (!WaitUntil(L, timeout, [&] { return bot.PathDone(request, &ok, &error); })) {
+            bot.StopWalk();
+            ok = false;
+            error = "timed out";
+        }
+        lua_pushboolean(L, ok);
+        if (ok) return 1;
+        PushString(L, error);
+        return 2;
+    }
+
+    int M_findPath(lua_State* L) {
+        Bot& bot = CheckBot(L);
+        std::vector<Pathfinder::Point> path;
+        const auto result = bot.FindPath(CheckInt(L, 2), CheckInt(L, 3), path);
+        if (result != Pathfinder::Result::Found) {
+            lua_pushnil(L);
+            lua_pushstring(L, Pathfinder::Describe(result));
+            return 2;
+        }
+        lua_createtable(L, static_cast<int>(path.size()), 0);
+        int i = 0;
+        for (const auto& point : path) {
+            lua_createtable(L, 0, 2);
+            lua_pushinteger(L, point.x); lua_setfield(L, -2, "x");
+            lua_pushinteger(L, point.y); lua_setfield(L, -2, "y");
+            lua_rawseti(L, -2, ++i);
+        }
+        return 1;
+    }
+
+    /* Copied out under the world lock, pushed after it (a Lua error must
+       never unwind through a held lock). */
+    struct TileView {
+        int x = 0, y = 0;
+        uint16_t fg = 0, bg = 0, flags = 0;
+        uint8_t kind = 0;
+        bool walkable = false;
+        std::string label;
+        int64_t owner = -1;
+        int64_t age = -1;
+        int fruit = 0;
+    };
+
+    std::optional<TileView> ViewTile(const WorldState& world, int x, int y, uint32_t userID) {
+        const WorldTile* tile = world.Tile(x, y);
+        if (!tile) return std::nullopt;
+        TileView view;
+        view.x = x;
+        view.y = y;
+        view.fg = tile->fg;
+        view.bg = tile->bg;
+        view.flags = tile->flags;
+        view.kind = tile->extraKind;
+        view.walkable = Pathfinder::EnterCost(world, x, y, 0, 0, userID) >= 0;
+        if (const auto* door = tile->As<TileExtra::Door>()) view.label = door->label;
+        else if (const auto* sign = tile->As<TileExtra::Sign>()) view.label = sign->label;
+        else if (const auto* lock = tile->As<TileExtra::Lock>()) view.owner = lock->ownerUID;
+        else if (const auto* seed = tile->As<TileExtra::Seed>()) {
+            view.age = seed->AgeNow();
+            view.fruit = seed->itemOnTree;
+        }
+        return view;
+    }
+
+    void PushTile(lua_State* L, const TileView& t) {
+        lua_createtable(L, 0, 12);
+        lua_pushinteger(L, t.x); lua_setfield(L, -2, "x");
+        lua_pushinteger(L, t.y); lua_setfield(L, -2, "y");
+        lua_pushinteger(L, t.fg); lua_setfield(L, -2, "fg");
+        lua_pushinteger(L, t.bg); lua_setfield(L, -2, "bg");
+        lua_pushinteger(L, t.flags); lua_setfield(L, -2, "flags");
+        lua_pushinteger(L, t.kind); lua_setfield(L, -2, "extraKind");
+        PushString(L, t.fg ? ItemDB::Name(t.fg) : std::string()); lua_setfield(L, -2, "fgName");
+        PushString(L, t.bg ? ItemDB::Name(t.bg) : std::string()); lua_setfield(L, -2, "bgName");
+        lua_pushboolean(L, t.walkable); lua_setfield(L, -2, "walkable");
+        if (!t.label.empty()) { PushString(L, t.label); lua_setfield(L, -2, "label"); }
+        if (t.owner >= 0) { lua_pushinteger(L, t.owner); lua_setfield(L, -2, "owner"); }
+        if (t.age >= 0) {
+            lua_pushinteger(L, t.age); lua_setfield(L, -2, "age");
+            lua_pushinteger(L, t.fruit); lua_setfield(L, -2, "fruit");
+            const ItemDB::Item* item = ItemDB::Find(t.fg);
+            lua_pushboolean(L, item && item->growTime > 0 && t.age >= item->growTime); lua_setfield(L, -2, "ready");
+        }
+    }
+
+    uint32_t UserOf(Bot& bot) { return static_cast<uint32_t>(bot.Read([](const BotSnapshot& s) { return s.userID; })); }
+
+    int M_getTile(lua_State* L) {
+        Bot& bot = CheckBot(L);
+        const int x = CheckInt(L, 2), y = CheckInt(L, 3);
+        const uint32_t userID = UserOf(bot);
+        const auto view = bot.ReadWorld([&](const WorldState& world) { return ViewTile(world, x, y, userID); });
+        if (!view) lua_pushnil(L);
+        else PushTile(L, *view);
+        return 1;
+    }
+
+    int M_getTiles(lua_State* L) {
+        Bot& bot = CheckBot(L);
+        const uint32_t userID = UserOf(bot);
+        const auto views = bot.ReadWorld([&](const WorldState& world) {
+            std::vector<TileView> out;
+            out.reserve(world.tiles.size());
+            for (size_t i = 0; i < world.tiles.size(); ++i) {
+                if (auto view = ViewTile(world, static_cast<int>(i % world.width), static_cast<int>(i / world.width), userID)) out.push_back(std::move(*view));
+            }
+            return out;
+        });
+        lua_createtable(L, static_cast<int>(views.size()), 0);
+        int i = 0;
+        for (const auto& view : views) {
+            PushTile(L, view);
+            lua_rawseti(L, -2, ++i);
+        }
+        return 1;
+    }
+
+    int M_findTiles(lua_State* L) {
+        Bot& bot = CheckBot(L);
+        const uint16_t id = CheckItem(L, 2);
+        const auto points = bot.ReadWorld([&](const WorldState& world) {
+            std::vector<Pathfinder::Point> out;
+            for (size_t i = 0; i < world.tiles.size(); ++i) {
+                if (world.tiles[i].fg == id || world.tiles[i].bg == id) out.push_back({ static_cast<int>(i % world.width), static_cast<int>(i / world.width) });
+            }
+            return out;
+        });
+        lua_createtable(L, static_cast<int>(points.size()), 0);
+        int i = 0;
+        for (const auto& point : points) {
+            lua_createtable(L, 0, 2);
+            lua_pushinteger(L, point.x); lua_setfield(L, -2, "x");
+            lua_pushinteger(L, point.y); lua_setfield(L, -2, "y");
+            lua_rawseti(L, -2, ++i);
+        }
+        return 1;
+    }
+
+    int M_getObjects(lua_State* L) {
+        const auto objects = CheckBot(L).ReadWorld([](const WorldState& world) { return world.objects; });
+        lua_createtable(L, static_cast<int>(objects.size()), 0);
+        int i = 0;
+        for (const auto& o : objects) {
+            const auto tile = Pathfinder::TileOf(o.x - 2.0f, o.y - 7.0f);
+            lua_createtable(L, 0, 8);
+            lua_pushinteger(L, o.uid); lua_setfield(L, -2, "uid");
+            lua_pushinteger(L, o.id); lua_setfield(L, -2, "id");
+            PushString(L, ItemDB::Name(o.id)); lua_setfield(L, -2, "name");
+            lua_pushinteger(L, o.count); lua_setfield(L, -2, "count");
+            lua_pushnumber(L, o.x); lua_setfield(L, -2, "x");
+            lua_pushnumber(L, o.y); lua_setfield(L, -2, "y");
+            lua_pushinteger(L, tile.x); lua_setfield(L, -2, "tileX");
+            lua_pushinteger(L, tile.y); lua_setfield(L, -2, "tileY");
+            lua_rawseti(L, -2, ++i);
+        }
+        return 1;
+    }
+
+    int M_collect(lua_State* L) {
+        lua_pushinteger(L, CheckBot(L).Collect(static_cast<int>(luaL_optinteger(L, 2, Pathfinder::REACH))));
+        return 1;
+    }
+
+    int M_setAutoCollect(lua_State* L) {
+        CheckBot(L).SetAutoCollect(lua_toboolean(L, 2), static_cast<int>(luaL_optinteger(L, 3, Pathfinder::REACH)));
+        return 0;
+    }
+
     int M_on(lua_State* L) { return AddHandler(L, 2, 3, CheckBot(L).Id()); }
 
     int M_wait(lua_State* L) {
@@ -839,9 +1023,12 @@ namespace {
     const luaL_Reg BOT_METHODS[] = {
         { "connect", M_connect }, { "disconnect", M_disconnect }, { "reconnect", M_reconnect },
         { "say", M_say }, { "talk", M_say }, { "warp", M_warp }, { "warpAndWait", M_warpAndWait }, { "leave", M_leave },
-        { "walk", M_walk }, { "move", M_move }, { "drop", M_drop }, { "trash", M_trash },
+        { "walk", M_walk }, { "walkAndWait", M_walkAndWait }, { "stopWalk", M_stopWalk }, { "findPath", M_findPath },
+        { "move", M_move }, { "drop", M_drop }, { "trash", M_trash },
         { "wear", M_wear }, { "unwear", M_wear }, { "use", M_wear },
-        { "punch", M_punch }, { "place", M_place }, { "wrench", M_wrench }, { "enter", M_enter },
+        { "punch", M_punch }, { "place", M_place }, { "wrench", M_wrench }, { "enter", M_enter }, { "inReach", M_inReach },
+        { "getTile", M_getTile }, { "getTiles", M_getTiles }, { "findTiles", M_findTiles }, { "getObjects", M_getObjects },
+        { "collect", M_collect }, { "setAutoCollect", M_setAutoCollect },
         { "respawn", M_respawn }, { "setTargetWorld", M_setTargetWorld }, { "setAutoReconnect", M_setAutoReconnect },
         { "sendText", M_sendText }, { "sendGameMessage", M_sendGameMessage }, { "sendPacket", M_sendPacket },
         { "dialogReturn", M_dialogReturn },
@@ -853,6 +1040,49 @@ namespace {
         { nullptr, nullptr },
     };
 
+    const ItemDB::Item* ItemArg(lua_State* L, int index) {
+        if (lua_type(L, index) == LUA_TNUMBER) return ItemDB::Find(static_cast<int>(luaL_checkinteger(L, index)));
+        return ItemDB::Find(std::string_view(luaL_checkstring(L, index)));
+    }
+
+    int L_getItemName(lua_State* L) {
+        const lua_Integer id = luaL_checkinteger(L, 1);
+        PushString(L, ItemDB::Name(static_cast<int>(id)));
+        return 1;
+    }
+
+    int L_getItemId(lua_State* L) {
+        const ItemDB::Item* item = ItemArg(L, 1);
+        if (item) lua_pushinteger(L, item->id);
+        else lua_pushnil(L);
+        return 1;
+    }
+
+    int L_getItemInfo(lua_State* L) {
+        const ItemDB::Item* item = ItemArg(L, 1);
+        if (!item) {
+            lua_pushnil(L);
+            return 1;
+        }
+        lua_createtable(L, 0, 10);
+        lua_pushinteger(L, item->id); lua_setfield(L, -2, "id");
+        PushString(L, item->name); lua_setfield(L, -2, "name");
+        lua_pushinteger(L, item->type); lua_setfield(L, -2, "type");
+        lua_pushinteger(L, item->collision); lua_setfield(L, -2, "collision");
+        lua_pushinteger(L, item->category); lua_setfield(L, -2, "category");
+        lua_pushinteger(L, item->rarity); lua_setfield(L, -2, "rarity");
+        lua_pushinteger(L, item->hits); lua_setfield(L, -2, "hits");
+        lua_pushinteger(L, item->growTime); lua_setfield(L, -2, "growTime");
+        lua_pushboolean(L, ItemDB::IsBackground(item->id)); lua_setfield(L, -2, "background");
+        PushString(L, item->info); lua_setfield(L, -2, "info");
+        return 1;
+    }
+
+    int L_itemsReady(lua_State* L) {
+        lua_pushboolean(L, ItemDB::Ready());
+        return 1;
+    }
+
     const luaL_Reg GLOBALS[] = {
         { "print", L_print }, { "log", L_log }, { "warn", L_warn },
         { "sleep", L_sleep }, { "millis", L_millis }, { "exit", L_exit },
@@ -863,6 +1093,7 @@ namespace {
         { "connectAll", L_connectAll }, { "disconnectAll", L_disconnectAll },
         { "on", L_on }, { "off", L_off }, { "wait", L_wait }, { "listen", L_listen },
         { "runScript", L_runScript }, { "stopScript", L_stopScript }, { "getScripts", L_getScripts },
+        { "getItemName", L_getItemName }, { "getItemId", L_getItemId }, { "getItemInfo", L_getItemInfo }, { "itemsReady", L_itemsReady },
         { nullptr, nullptr },
     };
 

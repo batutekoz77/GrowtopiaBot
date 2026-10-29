@@ -104,6 +104,9 @@
     <ClCompile Include="Source\Core\Text.cpp" />
     <ClCompile Include="Source\Game\Login.cpp" />
     <ClCompile Include="Source\Game\Protocol.cpp" />
+    <ClCompile Include="Source\Game\Items.cpp" />
+    <ClCompile Include="Source\Game\Pathfinder.cpp" />
+    <ClCompile Include="Source\Game\World.cpp" />
     <ClCompile Include="Source\Main\Bench.cpp" />
     <ClCompile Include="Source\Main\Config.cpp" />
     <ClCompile Include="Source\Main\Main.cpp" />
@@ -356,6 +359,9 @@
     <ClInclude Include="Source\Core\Text.hpp" />
     <ClInclude Include="Source\Game\Login.hpp" />
     <ClInclude Include="Source\Game\Protocol.hpp" />
+    <ClInclude Include="Source\Game\Items.hpp" />
+    <ClInclude Include="Source\Game\Pathfinder.hpp" />
+    <ClInclude Include="Source\Game\World.hpp" />
     <ClInclude Include="Source\Main\Bench.hpp" />
     <ClInclude Include="Source\Main\Config.hpp" />
     <ClInclude Include="Source\Net\Https.hpp" />

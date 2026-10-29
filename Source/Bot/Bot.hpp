@@ -1,6 +1,8 @@
 #pragma once
 
+#include "../Game/Pathfinder.hpp"
 #include "../Game/Protocol.hpp"
+#include "../Game/World.hpp"
 #include "../Main/Config.hpp"
 #include "Events.hpp"
 
@@ -72,6 +74,17 @@ struct BotSnapshot {
     uint32_t inventorySize = 0;
     std::map<uint16_t, InventoryItem> inventory;
     std::map<int32_t, PlayerInfo> players;
+
+    /* Pathfinding: the walk in progress and how the last one ended. */
+    bool walking = false;
+    int pathTargetX = 0, pathTargetY = 0;
+    size_t pathLeft = 0;
+    uint64_t pathDone = 0; /* the last walk request that ended */
+    bool pathOk = false;
+    std::string pathError;
+
+    bool autoCollect = false;
+    int collectRadius = Pathfinder::REACH;
 };
 
 class Bot {
@@ -92,6 +105,12 @@ public:
     template <typename F> auto Read(F&& reader) const {
         std::lock_guard lock(mutex_);
         return reader(static_cast<const BotSnapshot&>(state_));
+    }
+    /* The bot's current world (tiles, dropped items). Keep the reader short
+       and don't call other Bot methods from inside it. */
+    template <typename F> auto ReadWorld(F&& reader) const {
+        std::lock_guard lock(worldMutex_);
+        return reader(static_cast<const WorldState&>(world_));
     }
     int Id() const noexcept { return id_; }
     const std::string& GrowId() const noexcept { return entry_.growId; }
@@ -114,14 +133,28 @@ public:
     void Warp(const std::string& world, const std::string& door = {});
     void LeaveWorld();
     void Say(const std::string& text);
-    void Walk(int tileX, int tileY);
+    /* Walks there with A*, a tile per packet (see Bot.cpp). Returns the walk
+       request id for PathDone. A new walk replaces the running one. */
+    uint64_t Walk(int tileX, int tileY);
+    void StopWalk();
+    /* True once walk `request` has ended; `ok` = it arrived. */
+    bool PathDone(uint64_t request, bool* ok = nullptr, std::string* error = nullptr) const;
+    Pathfinder::Result FindPath(int tileX, int tileY, std::vector<Pathfinder::Point>& path) const;
     void Drop(uint16_t itemID, int amount);
     void Trash(uint16_t itemID, int amount);
     void Wear(uint16_t itemID);
-    void Punch(int tileX, int tileY);
-    void Place(int tileX, int tileY, uint16_t itemID);
-    void Wrench(int tileX, int tileY);
-    void Activate(int tileX, int tileY);
+    /* Tile actions only reach the server inside the 5x5 square around the
+       bot (Pathfinder::REACH); anything further is dropped, since the server
+       bans for it. The return value is that check at call time. */
+    bool InReach(int tileX, int tileY, bool placesBlock = false) const;
+    bool Punch(int tileX, int tileY);
+    bool Place(int tileX, int tileY, uint16_t itemID);
+    bool Wrench(int tileX, int tileY);
+    bool Activate(int tileX, int tileY);
+    /* Picks up the dropped items within `radius` tiles (at most REACH).
+       Returns how many are in range now. */
+    int Collect(int radius = Pathfinder::REACH);
+    void SetAutoCollect(bool enabled, int radius = Pathfinder::REACH);
     void Respawn();
     void DialogReturn(const std::string& dialog, const std::vector<std::pair<std::string, std::string>>& fields);
     void SendRawText(const std::string& text);
@@ -155,6 +188,11 @@ private:
 
     mutable std::mutex mutex_;
     BotSnapshot state_;
+    /* @important: lock order is worldMutex_ before mutex_, never the other
+       way. Only the bot thread writes world_, so it reads it without the lock. */
+    mutable std::mutex worldMutex_;
+    WorldState world_;
+    std::atomic<uint64_t> pathRequests_{ 0 };
     std::deque<std::function<void()>> queue_;
 
     std::mutex lifecycle_;
@@ -178,6 +216,10 @@ private:
 
     void Run(int delayMs);
     void Post(std::function<void()> command);
+    template <typename F> void EditWorld(F&& change) {
+        std::lock_guard lock(worldMutex_);
+        change(world_);
+    }
     template <typename F> void Update(F&& change) {
         std::lock_guard lock(mutex_);
         change(state_);
@@ -213,4 +255,19 @@ private:
     void SendTank(const Protocol::TankPacket& tank, bool reliable);
     void RequestJoin(const std::string& world, const std::string& door = {});
     void SendTileAction(int tileX, int tileY, uint16_t itemID, uint32_t stateFlag);
+
+    Pathfinder::Point CurrentTile() const;
+    bool CheckReach(const char* what, int tileX, int tileY, bool placesBlock);
+    void StartPath(int tileX, int tileY, uint64_t request);
+    void PathStep();
+    void EndPath(bool arrived, std::string reason);
+    void FinishPath(uint64_t request, bool arrived, std::string reason);
+    bool RouteBlocked() const;
+    void WalkTo(Pathfinder::Point tile, bool facingLeft);
+    std::vector<WorldObject> CollectTargets(int radius) const;
+    void CollectNear(int radius, bool quiet);
+
+    void OnTileChange(const Protocol::TankPacket& tank);
+    void OnTileUpdate(const Protocol::TankPacket& tank, std::span<const uint8_t> extended);
+    void OnItemChangeObject(const Protocol::TankPacket& tank);
 };

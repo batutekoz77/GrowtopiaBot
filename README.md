@@ -13,6 +13,10 @@ Growtopia Bot is a fast, lightweight, multi-bot manager for Growtopia. It logs i
 - **In-app script editor:** syntax view, live line tracking, Output panel and a one-line Lua console
 - **Event system:** `console`, `talk`, `world_enter`, `player_join`, `moderator`, `disconnected` and more
 - **Raw packets:** send `GENERIC_TEXT`, `GAME_MESSAGE` and tank packets yourself
+- **Pathfinding:** A* over the real world data (doors, locks, entrances, one-way blocks, platforms), walked one tile per packet
+- **Ban protection (5x5 reach guard):** punches, places, wrenches, door entries and item pickups outside the game's own 5x5 reach are never sent, raw packets included
+- **World data:** every tile (foreground, background, doors, signs, locks, trees...), dropped items and item names from `items.dat`
+- **Dropped item collection:** collect what is in reach, or let the bot auto-collect while it walks
 - **Very low resource usage:** 100 bots use ~14.5 % of one CPU core, and the panel idles at ~1 % CPU
 - **Nothing is saved to disk:** bots and settings only last until the program closes
 
@@ -45,8 +49,8 @@ Growtopia Bot is a fast, lightweight, multi-bot manager for Growtopia. It logs i
 - [x] In-app script editor with line tracking
 - [x] Advanced log system (ring buffer, ~2.5M lines/s)
 - [x] Built-in benchmarks & self tests (`--bench`, `--bench-ui`, `--selftest`)
-- [ ] Pathfinding
-- [ ] Tile data, dropped item collection & item names (items.dat)
+- [x] Pathfinding (ported from AquaProxy) with the 5x5 reach guard
+- [x] Tile data, dropped item collection & item names (items.dat)
 
 ---
 
@@ -59,12 +63,13 @@ Growtopia Bot is a fast, lightweight, multi-bot manager for Growtopia. It logs i
 - [x] Chat & packets: say messages or `/commands`, send raw text packets
 
 ## World:
-- [x] Tile grid around the bot, showing other players and moderators
+- [x] Tile grid around the bot (its 5x5 reach) with block / background names, solid tiles, other players and moderators
 - [x] Tools: **Punch**, **Place**, **Wrench**, **Door**, **Walk** (keys `1-5`)
-- [x] Move with `WASD` / arrow keys or walk to a tile
+- [x] Move with `WASD` / arrow keys or walk to any tile (pathfinding), with walk status and **Stop walking**
+- [x] Dropped items: nearest drops, **Collect nearby**, **Auto collect**, walk to a drop
 
 ## Inventory:
-- [x] Every item with its id and count
+- [x] Every item with its name, id and count (search by name or id)
 - [x] Drop / trash / wear / use
 
 ## Players:
@@ -83,6 +88,7 @@ Growtopia Bot is a fast, lightweight, multi-bot manager for Growtopia. It logs i
 - [x] Game client: version, protocol, fhash (raise these after a Growtopia update)
 - [x] Timing: login interval, rejoin delay
 - [x] Debug logging
+- [x] items.dat status (where it was loaded from)
 
 ---
 
@@ -114,6 +120,10 @@ cd GrowtopiaBot
 ```
 
 > No dependency setup needed: ENet, Lua and ImGui are already in the `Library/` folder.
+
+> **items.dat:** item names and tile collisions come from `items.dat`. The bot reads the one next to
+> `GrowtopiaBot.exe` first, then the game's cache (`%LOCALAPPDATA%\Growtopia\cache\items.dat`).
+> Without it everything still works, but items show as `#id` and the pathfinder only walks through air.
 
 ## Building the Bot
 1. Open `GrowtopiaBot.slnx` in **Visual Studio Community**
@@ -242,7 +252,7 @@ All are read-only and always up to date: `bot.world`, `bot.gems`...
 | `worldWidth`, `worldHeight` | `int` | World size in tiles |
 | `targetWorld` | `string` | World it returns to after a kick or reconnect |
 | `x`, `y` | `float` | Position in pixels |
-| `tileX`, `tileY` | `int` | Position in tiles (pixels / 32) |
+| `tileX`, `tileY` | `int` | Position in tiles (the avatar's centre) |
 | `gems` | `int` | Gem count |
 | `level` | `int` | Level |
 | `ping` | `int` | Ping in ms |
@@ -250,6 +260,8 @@ All are read-only and always up to date: `bot.world`, `bot.gems`...
 | `inventorySize` | `int` | Inventory slot count |
 | `proxy` | `string` | `host:port` (password hidden) or `""` |
 | `autoReconnect` | `bool` | Reconnects automatically on disconnect |
+| `walking` | `bool` | A `walk` is in progress |
+| `autoCollect` | `bool` | Collects dropped items by itself |
 
 ---
 
@@ -272,21 +284,39 @@ All are read-only and always up to date: `bot.world`, `bot.gems`...
 | `bot:warpAndWait(world, [timeoutMs=30000], [doorId])` | Warps and waits until it's inside → `true/false` |
 | `bot:leave()` | Leaves the world (to the world menu) |
 | `bot:setTargetWorld(world)` | World to return to after kicks / reconnects. `""` = off |
-| `bot:walk(tileX, tileY)` | One step to that tile |
-| `bot:move(dx, [dy=0])` | One step relative to the current tile |
+| `bot:walk(tileX, tileY)` | Walks there with pathfinding and returns right away. A new walk replaces the running one |
+| `bot:walkAndWait(tileX, tileY, [timeoutMs=30000])` | Walks and waits until it arrives → `true` / `false, reason` |
+| `bot:stopWalk()` | Stops walking |
+| `bot:findPath(tileX, tileY)` | The route without walking → `{ {x, y}, ... }` (both ends included) / `nil, reason` |
+| `bot:move(dx, [dy=0])` | Walks relative to the current tile |
 | `bot:respawn()` | Respawns |
-| `bot:enter(tileX, tileY)` | Enters the door / portal on that tile |
-| `bot:punch(tileX, tileY)` | Punches a tile |
-| `bot:place(tileX, tileY, itemId)` | Places a block / seed (only if it's in the inventory) |
-| `bot:wrench(tileX, tileY)` | Uses the wrench on a tile |
+| `bot:enter(tileX, tileY)` | Enters the door / portal on that tile → `bool` |
+| `bot:punch(tileX, tileY)` | Punches a tile → `bool` |
+| `bot:place(tileX, tileY, itemId)` | Places a block / seed (only if it's in the inventory) → `bool` |
+| `bot:wrench(tileX, tileY)` | Uses the wrench on a tile → `bool` |
+| `bot:inReach(tileX, tileY)` | The tile is inside the bot's 5x5 reach |
 
 ```lua
 local bot = getBot()
-if bot:warpAndWait("START") then
-    bot:walk(10, 20)
+if bot:warpAndWait("START") and bot:walkAndWait(10, 20) then
     bot:punch(11, 20)
 end
 ```
+
+#### 🧭 Pathfinding
+The pathfinder is the one from AquaProxy's `/path`: A* over the world's real tiles. Solid blocks, closed doors,
+entrances you have no access to, VIP / friends entrances, one-way blocks and platforms are respected, and
+fire / spikes are avoided when there is another way. The bot moves **one tile per packet** (two steps back to back,
+then a random 80–200 ms pause), and the steps are sent reliably (a lost step would look like a teleport to the server).
+If the route closes (a door shuts, a block is placed, the server moves the bot), it plans again from where it really is.
+
+#### 🛡 The 5x5 reach guard (ban protection)
+The game only punches / places / wrenches inside the **5x5 square** around the player (2 tiles on either axis).
+A character spawned with `mstate` / `smstate` can reach further, but the server flags those packets and **bans**.
+AquaProxy blocks this by dropping the packets a normal client could never send, and the bot does the same:
+every tile action outside the 5x5 square (raw `sendPacket` included) is **not sent** and a warning is logged.
+A block can't be placed on the tile the bot stands on (a background can). The `bool` that `punch` / `place` /
+`wrench` / `enter` return is that check at call time, so walk closer first (`walkAndWait`).
 
 ---
 
@@ -307,7 +337,7 @@ bot:dialogReturn("drop_item", { {"itemID", "242|"}, {"count", 10} })
 
 | Method | Returns | Description |
 |---|---|---|
-| `bot:getInventory()` | `table[]` | `{ id, count, flags }` tables |
+| `bot:getInventory()` | `table[]` | `{ id, name, count, flags }` tables |
 | `bot:getItemCount(id)` | `int` | Count of that item |
 | `bot:hasItem(id, [count=1])` | `bool` | Has the item |
 | `bot:drop(id, [count])` | `bool` | Drops the item (all if no count) |
@@ -321,6 +351,42 @@ if bot:hasItem(242, 10) then
     bot:drop(242, 10)
 end
 ```
+
+---
+
+### 🧱 Tiles & Dropped Items
+
+| Method | Returns | Description |
+|---|---|---|
+| `bot:getTile(tileX, tileY)` | `table` / `nil` | One tile (`nil` outside the world) |
+| `bot:getTiles()` | `table[]` | Every tile of the world (6000 tables for 100x60, don't call it in a tight loop) |
+| `bot:findTiles(itemId)` | `table[]` | Tiles with that item as foreground or background: `{ {x, y}, ... }` |
+| `bot:getObjects()` | `table[]` | Dropped items in the world |
+| `bot:collect([radius=2])` | `int` | Collects the dropped items within `radius` tiles (max 2) and returns how many are in range. Skips what doesn't fit (full stack of 200, full backpack) |
+| `bot:setAutoCollect(bool, [radius=2])` | – | Collects by itself while walking, when something drops and every 0.5 s |
+
+Tile table: `{ x, y, fg, bg, fgName, bgName, flags, extraKind, walkable }`, plus `label` on doors / signs,
+`owner` (userID) on locks and `age` (seconds), `fruit`, `ready` on trees.
+Object table: `{ uid, id, name, count, x, y, tileX, tileY }`.
+
+Tiles come from the world's map packet and stay up to date with the server's tile updates
+(punches, places, tile updates, harvested trees).
+
+```lua
+local bot = getBot()
+for _, t in ipairs(bot:findTiles(3)) do   -- 3 = Dirt Seed (getItemId("dirt seed"))
+    local tile = bot:getTile(t.x, t.y)
+    if tile.ready and bot:walkAndWait(t.x, t.y) then bot:punch(t.x, t.y) sleep(300) bot:collect() end
+end
+```
+
+#### Item info (global functions)
+| Function | Returns | Description |
+|---|---|---|
+| `getItemName(id)` | `string` | `"Dirt"`, or `"#2"` while items.dat isn't loaded |
+| `getItemId(name)` | `int` / `nil` | Case-insensitive: `getItemId("dirt seed")` |
+| `getItemInfo(id \| name)` | `table` / `nil` | `{ id, name, type, collision, category, rarity, hits, growTime, background, info }` |
+| `itemsReady()` | `bool` | items.dat is loaded |
 
 ---
 
@@ -415,6 +481,12 @@ local bot, world, w, h = wait("world_enter", 10000)
 | `packet` | `type, netID, value, x, y, punchX, punchY, flags` | Every incoming tank packet (**heavy**) |
 | `text` | `text` | Raw `GENERIC_TEXT` message |
 | `game_message` | `text` | Raw `GAME_MESSAGE` (`action\|log` etc.) |
+| `arrived` | `tileX, tileY` | A `walk` reached its target |
+| `path_fail` | `reason, tileX, tileY` | A `walk` ended without arriving (no way, world changed, stopped...) |
+| `tile_change` | `tileX, tileY, fg, bg` | A tile changed (broken, placed, updated) |
+| `object_drop` | `uid, itemId, count, x, y` | Something was dropped in the world |
+| `object_take` | `netID, itemId, count` | Another player picked something up |
+| `collect` | `itemId, count, uid` | The bot picked something up |
 | `*` | `eventName, values...` | All events (heavy) |
 
 > 💡 An event that nobody listens to is never created (~0.5 ns cost). Only listen to heavy events like `packet` / `*` when you need them, and `off(...)` them when you're done.
@@ -494,10 +566,10 @@ if b then print("server answer:", text) else print("no answer") end
 local bot = getBot()
 while true do
     if bot.inWorld and bot:getItemCount(242) >= 50 then
-        bot:warpAndWait("DEPOSIT")
-        bot:walk(10, 20) sleep(500)
-        bot:drop(242)              -- all of them
-        sleep(1000)
+        if bot:warpAndWait("DEPOSIT") and bot:walkAndWait(10, 20) then
+            bot:drop(242)          -- all of them
+            sleep(1000)
+        end
     end
     sleep(5000)
 end
@@ -524,6 +596,8 @@ More examples are in [`Docs/examples/`](Docs/examples) and the full API referenc
 | `bot:getPlayers()` | 0.8 – 1.7 µs |
 | `bot:sendText(...)` (queue a command) | 0.3 – 0.8 µs |
 | Events handled in Lua | 300 000 – 385 000 /s |
+| World map parse (100x60) | ~71 µs |
+| A* path (100x60 world) | 7 – 52 µs |
 
 > ⚠️ **The game itself** doesn't like fast commands. Spamming warp / drop / say can get you kicked or banned, so put `sleep` between commands and space out logins (`connectAll()`).
 

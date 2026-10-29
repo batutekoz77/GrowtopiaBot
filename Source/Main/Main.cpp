@@ -2,6 +2,7 @@
 #include "Config.hpp"
 #include "../Bot/BotManager.hpp"
 #include "../Core/Log.hpp"
+#include "../Game/Items.hpp"
 #include "../Script/ScriptEngine.hpp"
 #include "../UI/App.hpp"
 
@@ -37,6 +38,7 @@ int main(int argc, char** argv) {
     }
 
     Log::Info("MAIN", "Growtopia {} / protocol {}", settings.client.gameVersion, settings.client.protocol);
+    ItemDB::LoadAsync();
 
     int exitCode = 0;
     {

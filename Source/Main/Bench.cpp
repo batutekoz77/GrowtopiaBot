@@ -3,6 +3,8 @@
 #include "../Bot/BotManager.hpp"
 #include "../Core/Log.hpp"
 #include "../Core/Text.hpp"
+#include "../Game/Items.hpp"
+#include "../Game/Pathfinder.hpp"
 #include "../Game/Protocol.hpp"
 #include "../Script/ScriptEngine.hpp"
 #include "../UI/App.hpp"
@@ -104,6 +106,66 @@ namespace {
         enet_peer_send(peer, 0, enet_packet_create(payload.data(), payload.size(), reliable ? ENET_PACKET_FLAG_RELIABLE : 0));
     }
 
+    template <typename T>
+    void Put(std::vector<uint8_t>& out, T value) {
+        const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
+        out.insert(out.end(), bytes, bytes + sizeof(T));
+    }
+
+    /* A real SEND_MAP_DATA (map version 0x19): 100 x 60, a dirt floor on row
+       11, a dirt wall on x = 15 from y = 4 to 10, a sign at (5, 10) and two
+       dropped items: 5 x item 242 on (11, 10) and 3 x item 2 on (40, 10).
+       Bots spawn on (10, 10). */
+    constexpr uint32_t MAP_W = 100, MAP_H = 60;
+
+    bool MapSolid(int x, int y) { return y == 11 || (x == 15 && y >= 4 && y <= 10); }
+
+    std::vector<uint8_t> BuildMap(const std::string& world) {
+        std::vector<uint8_t> map;
+        Put<uint16_t>(map, 0x19);
+        Put<uint32_t>(map, 0);
+        Put<uint16_t>(map, static_cast<uint16_t>(world.size()));
+        map.insert(map.end(), world.begin(), world.end());
+        Put<uint32_t>(map, MAP_W);
+        Put<uint32_t>(map, MAP_H);
+        Put<uint32_t>(map, MAP_W * MAP_H);
+        map.insert(map.end(), 5, 0);
+        for (uint32_t i = 0; i < MAP_W * MAP_H; ++i) {
+            const int x = static_cast<int>(i % MAP_W), y = static_cast<int>(i / MAP_W);
+            const bool sign = x == 5 && y == 10;
+            Put<uint16_t>(map, sign ? 20 : MapSolid(x, y) ? 2 : 0);   /* fg */
+            Put<uint16_t>(map, y >= 11 ? 14 : 0);                      /* bg: cave background */
+            Put<uint16_t>(map, 0);                                     /* parent */
+            Put<uint16_t>(map, sign ? 0x0001 : 0);                     /* flags */
+            if (sign) {
+                Put<uint8_t>(map, 2);                                  /* extra kind: sign */
+                const std::string label = "hello sign";
+                Put<uint16_t>(map, static_cast<uint16_t>(label.size()));
+                map.insert(map.end(), label.begin(), label.end());
+                Put<uint32_t>(map, 0xFFFFFFFF);
+            }
+        }
+        map.insert(map.end(), 12, 0);
+        Put<uint32_t>(map, 2);   /* objects */
+        Put<uint32_t>(map, 2);   /* last uid */
+        const struct { uint16_t id; float x, y; uint8_t count; uint32_t uid; } drops[] = {
+            { 242, 11 * 32 + 8.0f, 10 * 32 + 8.0f, 5, 1 },
+            { 2, 40 * 32 + 8.0f, 10 * 32 + 8.0f, 3, 2 },
+        };
+        for (const auto& d : drops) {
+            Put<uint16_t>(map, d.id);
+            Put<float>(map, d.x);
+            Put<float>(map, d.y);
+            Put<uint8_t>(map, d.count);
+            Put<uint8_t>(map, 0);
+            Put<uint32_t>(map, d.uid);
+        }
+        Put<uint16_t>(map, 0);
+        Put<uint16_t>(map, 0);
+        Put<uint16_t>(map, 0);
+        return map;
+    }
+
     void SendCall(ENetPeer* peer, std::initializer_list<Arg> args) {
         TankPacket tank;
         tank.type = PACKET_CALL_FUNCTION;
@@ -146,6 +208,11 @@ namespace {
         HANDLE Thread() { return thread_.native_handle(); }
         uint64_t Sent() const noexcept { return sent_; }
 
+        /* What a real server would flag: tile actions outside the 5x5 reach
+           (or a block placed on the bot's own tile), and position jumps of
+           more than one tile between two state packets. */
+        std::atomic<uint64_t> tileActions{ 0 }, reachViolations{ 0 }, walkSteps{ 0 }, teleports{ 0 }, collects{ 0 };
+
         bool WaitMarker(int marker, Clock::time_point& at, std::chrono::milliseconds timeout) {
             std::unique_lock lock(markerMutex_);
             if (!markerCv_.wait_for(lock, timeout, [&] { return markers_.contains(marker); })) return false;
@@ -155,7 +222,15 @@ namespace {
         }
 
     private:
-        struct Peer { bool inWorld = false; int netID = 0; float x = 0.0f; };
+        struct Peer { bool inWorld = false; int netID = 0; float x = 0.0f; float posX = 320.0f, posY = 320.0f; };
+
+        void CheckReach(Peer& p, int x, int y, bool placesBlock, const char* what) {
+            ++tileActions;
+            const Pathfinder::Point here = Pathfinder::TileOf(p.posX, p.posY);
+            if (Pathfinder::InReach(here, x, y, placesBlock)) return;
+            ++reachViolations;
+            Out("    !! fake server: {} at ({}, {}) from ({}, {}) is out of reach", what, x, y, here.x, here.y);
+        }
 
         ENetHost* host_ = nullptr;
         uint16_t port_ = 0;
@@ -190,22 +265,59 @@ namespace {
                     markerCv_.notify_all();
                 }
             }
+            else if (type == NET_MESSAGE_GAME_PACKET) {
+                const auto tank = TankOf(data);
+                if (!tank) return;
+                Peer& p = peers_[peer];
+                switch (tank->type) {
+                    case PACKET_STATE: {
+                        const Pathfinder::Point from = Pathfinder::TileOf(p.posX, p.posY), to = Pathfinder::TileOf(tank->x, tank->y);
+                        if (std::max(std::abs(to.x - from.x), std::abs(to.y - from.y)) > 1) {
+                            ++teleports;
+                            Out("    !! fake server: state packet jumped from ({}, {}) to ({}, {})", from.x, from.y, to.x, to.y);
+                        }
+                        if (tank->flags & STATE_WALK) ++walkSteps;
+                        p.posX = tank->x;
+                        p.posY = tank->y;
+                        if (tank->flags & (STATE_PUNCH | STATE_PLACE)) CheckReach(p, tank->punchX, tank->punchY, false, "state punch");
+                        break;
+                    }
+                    case PACKET_TILE_CHANGE_REQUEST: {
+                        const bool placesBlock = tank->value != 18 && tank->value != 32 && !ItemDB::IsBackground(tank->value);
+                        CheckReach(p, tank->punchX, tank->punchY, placesBlock, "tile change");
+                        if (tank->value == 18) {
+                            /* The block breaks at once. */
+                            TankPacket echo = *tank;
+                            echo.netID = p.netID;
+                            Send(peer, MakeTank(echo));
+                        }
+                        break;
+                    }
+                    case PACKET_TILE_ACTIVATE_REQUEST:
+                        CheckReach(p, tank->punchX, tank->punchY, false, "tile activate");
+                        break;
+                    case PACKET_ITEM_ACTIVATE_OBJECT_REQUEST: {
+                        ++collects;
+                        TankPacket taken;
+                        taken.type = PACKET_ITEM_CHANGE_OBJECT;
+                        taken.netID = p.netID;
+                        taken.value = tank->value;
+                        Send(peer, MakeTank(taken));
+                        break;
+                    }
+                    default: break;
+                }
+            }
             else if (type == NET_MESSAGE_GAME_MESSAGE && Text::Contains(text, "action|join_request")) {
                 std::string world = "BENCH";
                 if (const auto name = Text::Value(text, "name")) world = std::string(Text::Split(*name, '|')[0]);
                 Peer& p = peers_[peer];
                 p.netID = nextNetID_++;
+                p.posX = p.posY = 320.0f;
 
-                std::vector<uint8_t> map(8, 0);
-                const uint16_t length = static_cast<uint16_t>(world.size());
-                std::memcpy(map.data() + 6, &length, 2);
-                map.insert(map.end(), world.begin(), world.end());
-                const uint32_t width = 100, height = 60;
-                map.insert(map.end(), reinterpret_cast<const uint8_t*>(&width), reinterpret_cast<const uint8_t*>(&width) + 4);
-                map.insert(map.end(), reinterpret_cast<const uint8_t*>(&height), reinterpret_cast<const uint8_t*>(&height) + 4);
                 TankPacket tank;
                 tank.type = PACKET_SEND_MAP_DATA;
-                Send(peer, MakeTank(tank, map));
+                Send(peer, MakeTank(tank, BuildMap(world)));
                 SendCall(peer, { std::string("OnSpawn"), std::format("spawn|avatar\nnetID|{}\nuserID|{}\nposXY|320|320\nname|bench{}\ntype|local\n", p.netID, p.netID, p.netID) });
                 SendCall(peer, { std::string("OnSpawn"), std::string("spawn|avatar\nnetID|999999\nuserID|7\nposXY|0|320\nname|walker\ncountry|us\n") });
                 if (sendInventory) {
@@ -474,6 +586,7 @@ int Bench::Run(int argc, char** argv) {
         return 1;
     }
     Net::Startup();
+    ItemDB::LoadAsync();
 
     Out("GrowtopiaBot benchmark: {} bots, {} s per phase, {} packets/s per bot of world traffic, {} cores",
         botCount, seconds, rate, std::thread::hardware_concurrency());
@@ -603,6 +716,33 @@ int Bench::Run(int argc, char** argv) {
         Out("    {} lines in {:.1f} ms = {:.0f} lines/s", perThread * 4, ms, perThread * 4 / ms * 1000.0);
     }
 
+    Out("\n6) World parse + A* (the fake 100 x 60 map with a wall)");
+    {
+        const auto map = BuildMap("BENCH");
+        WorldState world;
+        const int parses = 2000;
+        const auto p0 = Clock::now();
+        for (int i = 0; i < parses; ++i) world.Parse(map);
+        const double parseUs = std::chrono::duration<double, std::micro>(Clock::now() - p0).count() / parses;
+        std::vector<Pathfinder::Point> path;
+        const int finds = 2000;
+        const auto f0 = Clock::now();
+        for (int i = 0; i < finds; ++i) Pathfinder::Find(world, { 10, 10 }, { 20, 10 }, 1, path);
+        const double nearUs = std::chrono::duration<double, std::micro>(Clock::now() - f0).count() / finds;
+        const size_t nearLength = path.size();
+        const auto g0 = Clock::now();
+        for (int i = 0; i < finds; ++i) Pathfinder::Find(world, { 1, 10 }, { 98, 0 }, 1, path);
+        const double farUs = std::chrono::duration<double, std::micro>(Clock::now() - g0).count() / finds;
+        const size_t farLength = path.size();
+        const auto n0 = Clock::now();
+        for (int i = 0; i < finds; ++i) Pathfinder::Find(world, { 10, 10 }, { 50, 40 }, 1, path);
+        const double noneUs = std::chrono::duration<double, std::micro>(Clock::now() - n0).count() / finds;
+        Out("    map parse            : {:.1f} us ({} bytes, {} tiles, loaded {})", parseUs, map.size(), world.tiles.size(), world.loaded);
+        Out("    A* around the wall   : {:.1f} us ({} tiles)", nearUs, nearLength);
+        Out("    A* across the world  : {:.1f} us ({} tiles)", farUs, farLength);
+        Out("    A* with no way there : {:.1f} us (searches the whole open area)", noneUs);
+    }
+
     Out("\nSummary (bot loop, {} bots):", botCount);
     Out("  CPU      : {:.2f} % -> {:.2f} % of a core ({:+.0f} %)", legacy.cpuPercentOfCore, current.cpuPercentOfCore,
         legacy.cpuPercentOfCore > 0 ? (current.cpuPercentOfCore / legacy.cpuPercentOfCore - 1.0) * 100.0 : 0.0);
@@ -669,9 +809,9 @@ int Bench::RunUi(int argc, char** argv) {
 
 namespace {
     constexpr const char* SELFTEST = R"lua(
-local passed, failed = 0, 0
+local passed, failed, failedNames = 0, 0, {}
 local function check(name, ok, detail)
-    if ok then passed = passed + 1 else failed = failed + 1 end
+    if ok then passed = passed + 1 else failed = failed + 1 failedNames[#failedNames + 1] = name end
     print(string.format("TEST %s %s%s", ok and "PASS" or "FAIL", name, detail and ("  (" .. tostring(detail) .. ")") or ""))
 end
 
@@ -730,6 +870,83 @@ bot:move(-1, 0)
 sleep(100)
 check("move", bot.tileX == 11, bot.tileX)
 bot:punch(11, 11) bot:place(11, 11, 2) bot:wrench(11, 11) bot:enter(11, 11)
+
+sleep(300)
+check("punch echo breaks the block", bot:getTile(11, 11).fg == 0, bot:getTile(11, 11).fg)
+-- world data (the fake map: dirt floor on row 11, wall x = 15 / y 4..10, sign on 5,10)
+check("itemsReady() is boolean", type(itemsReady()) == "boolean")
+check("getTile floor", bot:getTile(12, 11) ~= nil and bot:getTile(12, 11).fg == 2, bot:getTile(12, 11) and bot:getTile(12, 11).fg)
+check("getTile background", bot:getTile(12, 11).bg == 14)
+check("getTile air is walkable", bot:getTile(12, 9).walkable == true)
+check("getTile wall is solid", bot:getTile(15, 8).walkable == false)
+check("sign label", bot:getTile(5, 10).label == "hello sign", bot:getTile(5, 10).label)
+check("getTile outside the world", bot:getTile(500, 5) == nil and bot:getTile(-1, 5) == nil)
+check("findTiles(2)", #bot:findTiles(2) == 106, #bot:findTiles(2))
+check("getTiles()", #bot:getTiles() == 6000, #bot:getTiles())
+
+-- pathfinding
+local path, why = bot:findPath(20, 10)
+local adjacent, clear = path ~= nil, path ~= nil
+if path then
+    for i = 2, #path do
+        local d = math.abs(path[i].x - path[i - 1].x) + math.abs(path[i].y - path[i - 1].y)
+        if d ~= 1 then adjacent = false end
+        if path[i].x == 15 and path[i].y >= 4 and path[i].y <= 11 then clear = false end
+    end
+end
+check("findPath goes around the wall", path ~= nil and path[#path].x == 20 and #path > 11, why or #path)
+check("findPath steps are one tile", adjacent)
+check("findPath avoids solid tiles", clear)
+check("findPath into a block fails", bot:findPath(15, 8) == nil)
+check("findPath outside fails", bot:findPath(5000, 1) == nil)
+local arrived = 0
+local arrivedId = on("arrived", function() arrived = arrived + 1 end)
+local ok, err = bot:walkAndWait(20, 10, 15000)
+check("walkAndWait around the wall", ok and bot.tileX == 20 and bot.tileY == 10, err or (bot.tileX .. "," .. bot.tileY))
+check("not walking after arriving", bot.walking == false)
+sleep(100)
+check("arrived event", arrived == 1, arrived)
+off(arrivedId)
+local pathFails = 0
+on("path_fail", function() pathFails = pathFails + 1 end)
+check("walkAndWait into a block fails", bot:walkAndWait(15, 8, 3000) == false)
+sleep(100)
+check("path_fail event", pathFails == 1, pathFails)
+off("path_fail")
+bot:walk(10, 3)
+sleep(150)
+check("walking", bot.walking == true)
+bot:stopWalk()
+sleep(150)
+check("stopWalk", bot.walking == false)
+
+-- the 5x5 reach guard
+check("walk back", bot:walkAndWait(10, 10, 15000))
+check("inReach 2 tiles", bot:inReach(12, 12))
+check("not inReach 3 tiles", not bot:inReach(13, 10))
+check("far punch refused", bot:punch(30, 10) == false)
+check("far wrench refused", bot:wrench(10, 20) == false)
+check("far enter refused", bot:enter(14, 10) == false)
+bot:sendPacket({ type = 3, value = 18, x = bot.x, y = bot.y, punchX = 40, punchY = 10 })
+check("near punch allowed", bot:punch(12, 10) == true)
+
+-- dropped items
+local objects = bot:getObjects()
+check("getObjects()", #objects == 2, #objects)
+check("object fields", objects[1].uid == 1 and objects[1].id == 242 and objects[1].count == 5 and objects[1].tileX == 11 and objects[1].tileY == 10)
+check("collect() only takes what is in reach", bot:collect() == 1)
+sleep(400)
+check("collected into the inventory", bot:getItemCount(242) == 5, bot:getItemCount(242))
+check("collected object is gone", #bot:getObjects() == 1 and bot:getObjects()[1].uid == 2)
+check("nothing more in reach", bot:collect() == 0)
+bot:setAutoCollect(true)
+check("autoCollect property", bot.autoCollect == true)
+bot:setAutoCollect(false)
+check("item names", getItemName(242) ~= nil and (not itemsReady() or getItemName(2) == "Dirt"), getItemName(2))
+check("getItemId", not itemsReady() or getItemId("dirt") == 2)
+check("getItemInfo", not itemsReady() or (getItemInfo(2).name == "Dirt" and getItemInfo("Dirt").id == 2))
+check("inventory names", bot:getInventory()[1].name ~= nil)
+
 bot:wear(48) bot:respawn() bot:leave()
 bot:sendText("action|bench\n") bot:sendGameMessage("action|bench\n")
 bot:sendPacket({ type = 0, x = 320, y = 320, flags = 0x20 })
@@ -760,7 +977,7 @@ check("pcall returns values", select(2, pcall(function() return 42 end)) == 42)
 check("getScripts", #getScripts() >= 1)
 local nb, err = addBot("", "")
 check("addBot validates", nb == nil and err ~= nil, err)
-print(string.format("TEST RESULT %d passed, %d failed", passed, failed))
+print(string.format("TEST RESULT %d passed, %d failed%s", passed, failed, failed > 0 and (": " .. table.concat(failedNames, ", ")) or ""))
 )lua";
 
     constexpr const char* UNSTOPPABLE = R"lua(
@@ -778,6 +995,7 @@ int Bench::RunTests(int argc, char** argv) {
     }
     if (enet_initialize() != 0) return 1;
     Net::Startup();
+    ItemDB::LoadAsync();
     FakeServer server(20);
     if (!server.Start()) return 1;
 
@@ -811,6 +1029,28 @@ int Bench::RunTests(int argc, char** argv) {
             Out("{}", line.text.substr(5));
             if (line.text.starts_with("TEST FAIL")) ++failures;
         }
+
+        const auto expect = [&](const char* name, bool ok, const std::string& detail) {
+            Out("{} {}  ({})", ok ? "PASS" : "FAIL", name, detail);
+            if (!ok) ++failures;
+        };
+        expect("server saw walk steps", server.walkSteps > 20, std::to_string(server.walkSteps.load()));
+        expect("server saw tile actions", server.tileActions > 0, std::to_string(server.tileActions.load()));
+        expect("no tile action outside the 5x5 reach", server.reachViolations == 0, std::to_string(server.reachViolations.load()));
+        expect("no position jump over one tile", server.teleports == 0, std::to_string(server.teleports.load()));
+        expect("collect requests reached the server", server.collects == 1, std::to_string(server.collects.load()));
+
+        /* items.dat: only when this machine has one. */
+        for (int i = 0; i < 300 && !ItemDB::Ready() && ItemDB::Status() == "loading..."; ++i) std::this_thread::sleep_for(50ms);
+        if (ItemDB::Ready()) {
+            const ItemDB::Item* dirt = ItemDB::Find(2);
+            expect("items.dat: item 2 is Dirt", dirt && dirt->name == "Dirt", ItemDB::Status());
+            expect("items.dat: lookup by name", ItemDB::Find("dirt seed") && ItemDB::Find("dirt seed")->id == 3, ItemDB::Name(3));
+            expect("items.dat: dirt is solid, its seed is not", dirt && dirt->collision == ItemDB::Collision::FULL &&
+                ItemDB::Find(3) && ItemDB::Find(3)->collision != ItemDB::Collision::FULL, std::format("{} / {}", dirt ? dirt->collision : -1, ItemDB::Find(3) ? ItemDB::Find(3)->collision : -1));
+            expect("items.dat: cave background is a background", ItemDB::IsBackground(14), ItemDB::Name(14));
+        }
+        else Out("SKIP items.dat checks ({})", ItemDB::Status());
 
         {
             constexpr const char* TRACE = "local total = 0\n"
